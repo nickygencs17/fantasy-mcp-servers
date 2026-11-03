@@ -17,3 +17,6 @@ __pycache__/
 *.log
 cost-log.json
 .DS_Store
+
+# Draft player cache (rebuilt automatically)
+draft/cache/
