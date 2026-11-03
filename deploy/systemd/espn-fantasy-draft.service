@@ -1,0 +1,15 @@
+[Unit]
+Description=ESPN Fantasy Draft MCP Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/espn-fantasy
+# MCP_HTTP_PORT and MCP_AUTH_TOKEN live here, outside the repo (chmod 600)
+EnvironmentFile=/etc/fantasy-mcp/espn-fantasy-draft.env
+ExecStart=/opt/espn-fantasy/venv/bin/python /opt/espn-fantasy/server.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

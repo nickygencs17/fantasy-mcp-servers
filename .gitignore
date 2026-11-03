@@ -1,0 +1,19 @@
+# Secrets: never commit
+.env
+.env.*
+!.env.example
+*.env
+!*.env.example
+
+# Dependencies and builds
+node_modules/
+dist/
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Logs and local state
+*.log
+cost-log.json
+.DS_Store

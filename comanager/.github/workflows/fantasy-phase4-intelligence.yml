@@ -1,0 +1,792 @@
+name: Fantasy Football Phase 4 - Advanced Intelligence
+
+on:
+  # Optimized scheduled runs for NFL season only (September-January)
+  # NOTE: GitHub Actions uses UTC time. During NFL season (Sep-Jan):
+  # - September to early November: EDT (UTC-4)
+  # - Early November to January: EST (UTC-5)
+  schedule:
+    # Season-Aware Daily Analysis - 8 AM Eastern, NFL season only (Sep-Jan)
+    # Runs during months 9-12 and 1 (September through January)
+    - cron: '0 13 * 9-12,1 *'
+    
+    # Game Day Monitoring - Every 4 hours on game days (Sun/Mon/Thu) during NFL season
+    # Runs at 12AM, 4AM, 8AM, 12PM, 4PM, 8PM UTC (avoiding 1 PM UTC daily run)
+    - cron: '0 0,4,8,12,16,20 * 9-12,1 0,1,4'
+    
+    # Weekly Waiver Analysis - Tuesday 10 AM Eastern during NFL season
+    # Essential for waiver wire decisions
+    - cron: '0 14 * 9-12,1 2'
+  
+  # Manual triggers
+  workflow_dispatch:
+    inputs:
+      intelligence_mode:
+        description: 'Intelligence mode to run'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - realtime
+          - learning
+          - analytics
+          - seasonal
+          - emergency
+      week:
+        description: 'NFL Week Number'
+        required: false
+        default: '1'
+      force_execution:
+        description: 'Force execution even if conditions not met'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  NODE_ENV: production
+  ENABLE_PERFORMANCE_TRACKING: 'true'
+  ENABLE_AB_TESTING: 'true'
+  ENABLE_CROSS_LEAGUE: 'true'
+
+jobs:
+  # Preflight checks for all Phase 4 operations
+  preflight-intelligence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+      intelligence_mode: ${{ steps.check.outputs.intelligence_mode }}
+      current_week: ${{ steps.check.outputs.current_week }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: 'fantasy-engine/automation/package-lock.json'
+
+      - name: Install Dependencies
+        working-directory: fantasy-engine/automation
+        run: |
+          npm ci
+          npm run build
+
+      - name: Intelligence Preflight Check
+        id: check
+        working-directory: fantasy-engine/automation
+        env:
+          ESPN_S2: ${{ secrets.ESPN_S2 }}
+          ESPN_SWID: ${{ secrets.ESPN_SWID }}
+          LEAGUE_1_ID: ${{ secrets.LEAGUE_1_ID }}
+          LEAGUE_1_TEAM_ID: ${{ secrets.LEAGUE_1_TEAM_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.7-flash' }}
+          CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+          PRIMARY_LLM_PROVIDER: ${{ vars.PRIMARY_LLM_PROVIDER || 'gemini' }}
+        run: |
+          echo "🧠 Phase 4 Intelligence Preflight Check"
+          echo "Triggered by: ${{ github.event_name }}"
+          echo "Intelligence Mode: ${{ github.event.inputs.intelligence_mode || 'auto' }}"
+          
+          # Determine intelligence mode based on trigger
+          if [[ "${{ github.event.inputs.intelligence_mode }}" != "" ]]; then
+            INTEL_MODE="${{ github.event.inputs.intelligence_mode }}"
+          elif [[ "${{ github.event.schedule }}" == "0 12 * * *" ]]; then
+            INTEL_MODE="full"
+          elif [[ "${{ github.event.schedule }}" == "0 */2 * * 0,1,4" ]]; then
+            INTEL_MODE="realtime"
+          elif [[ "${{ github.event.schedule }}" == "0 16 * * 0" ]]; then
+            INTEL_MODE="full"
+          elif [[ "${{ github.event.schedule }}" == "0 23 * * 4" ]]; then
+            INTEL_MODE="full"
+          elif [[ "${{ github.event.schedule }}" == "0 23 * * 1" ]]; then
+            INTEL_MODE="full"
+          elif [[ "${{ github.event.schedule }}" == "0 14 * * 2" ]]; then
+            INTEL_MODE="analytics"
+          else
+            INTEL_MODE="full"
+          fi
+          
+          echo "intelligence_mode=$INTEL_MODE" >> $GITHUB_OUTPUT
+          
+          # Calculate current NFL week
+          CURRENT_WEEK=$(node -e "
+            const now = new Date();
+            const seasonStart = new Date(now.getFullYear(), 8, 1);
+            const weeksSinceStart = Math.floor((now.getTime() - seasonStart.getTime()) / (7 * 24 * 60 * 60 * 1000));
+            console.log(Math.max(1, Math.min(18, weeksSinceStart + 1)));
+          ")
+          echo "current_week=$CURRENT_WEEK" >> $GITHUB_OUTPUT
+          
+          # Initialize environment and validate configuration
+          if node dist/cli.js init; then
+            echo "✅ Environment initialization successful"
+            SHOULD_RUN="true"
+          else
+            echo "❌ Environment initialization failed - will skip intelligence execution"
+            SHOULD_RUN="false"
+          fi
+          
+          # Skip emergency mode during off-season (only if init was successful)
+          if [[ "$SHOULD_RUN" == "true" && "$INTEL_MODE" == "emergency" && $CURRENT_WEEK -lt 1 ]]; then
+            echo "⏭️ Skipping emergency intelligence during off-season"
+            SHOULD_RUN="false"
+          fi
+          
+          # Force execution override
+          if [[ "${{ github.event.inputs.force_execution }}" == "true" ]]; then
+            echo "🚀 Force execution enabled"
+            SHOULD_RUN="true"
+          fi
+          
+          echo "should_run=$SHOULD_RUN" >> $GITHUB_OUTPUT
+          echo "✅ Preflight check complete: mode=$INTEL_MODE, week=$CURRENT_WEEK, run=$SHOULD_RUN"
+
+  # Phase 4 Advanced Intelligence Execution
+  advanced-intelligence:
+    runs-on: ubuntu-latest
+    needs: preflight-intelligence
+    if: needs.preflight-intelligence.outputs.should_run == 'true'
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # Run different intelligence modes in parallel when appropriate
+        include:
+          - mode: ${{ needs.preflight-intelligence.outputs.intelligence_mode }}
+            primary: true
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: 'fantasy-engine/automation/package-lock.json'
+
+      - name: Install Dependencies
+        working-directory: fantasy-engine/automation
+        run: |
+          npm ci
+          npm run build
+
+      - name: Load Historical Intelligence Data
+        working-directory: fantasy-engine/automation
+        run: |
+          echo "📊 Loading historical intelligence data..."
+          # In production, this would restore from persistent storage
+          # For now, create minimal structure for testing
+          echo '{"patterns": [], "last_updated": "'$(date -Iseconds)'"}' > learning_patterns.json
+          echo '{"current_season": 2025, "historical_data": []}' > seasonal_intelligence.json
+          echo '[]' > decision_history.json
+
+      - name: Execute Phase 4 Intelligence
+        id: intelligence
+        working-directory: fantasy-engine/automation
+        timeout-minutes: 20
+        env:
+          # ESPN Authentication
+          ESPN_S2: ${{ secrets.ESPN_S2 }}
+          ESPN_SWID: ${{ secrets.ESPN_SWID }}
+          
+          # League Configuration
+          LEAGUE_1_ID: ${{ secrets.LEAGUE_1_ID }}
+          LEAGUE_1_TEAM_ID: ${{ secrets.LEAGUE_1_TEAM_ID }}
+          LEAGUE_1_NAME: ${{ secrets.LEAGUE_1_NAME || 'Main League' }}
+          LEAGUE_2_ID: ${{ secrets.LEAGUE_2_ID }}
+          LEAGUE_2_TEAM_ID: ${{ secrets.LEAGUE_2_TEAM_ID }}
+          
+          # LLM Configuration
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.7-flash' }}
+          CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
+          PRIMARY_LLM_PROVIDER: ${{ vars.PRIMARY_LLM_PROVIDER || 'gemini' }}
+          
+          # FantasyPros Configuration (Optional)
+          FANTASYPROS_SESSION_ID: ${{ secrets.FANTASYPROS_SESSION_ID }}
+          FANTASYPROS_EMAIL: ${{ secrets.FANTASYPROS_EMAIL }}
+          FANTASYPROS_PASSWORD: ${{ secrets.FANTASYPROS_PASSWORD }}
+          LEAGUE_2_NAME: ${{ secrets.LEAGUE_2_NAME || 'Secondary League' }}
+          
+          # Additional LLM Configuration
+          FALLBACK_LLM_PROVIDER: ${{ vars.FALLBACK_LLM_PROVIDER || 'claude' }}
+          
+          # Cost Limits
+          DAILY_COST_LIMIT: ${{ vars.DAILY_COST_LIMIT || '3.00' }}
+          WEEKLY_COST_LIMIT: ${{ vars.WEEKLY_COST_LIMIT || '15.00' }}
+          MONTHLY_COST_LIMIT: ${{ vars.MONTHLY_COST_LIMIT || '50.00' }}
+          
+          # Feature Flags
+          ENABLE_FANTASYPROS: ${{ vars.ENABLE_FANTASYPROS || 'false' }}
+          ENABLE_WEATHER: ${{ vars.ENABLE_WEATHER || 'false' }}
+          ENABLE_NEWS: ${{ vars.ENABLE_NEWS || 'false' }}
+          
+          # Notification Configuration
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          
+          # Advanced Intelligence Configuration
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+          NEWS_API_KEY: ${{ secrets.NEWS_API_KEY }}
+        run: |
+          echo "🧠 Executing Phase 4 Advanced Intelligence"
+          echo "Mode: ${{ matrix.mode }}"
+          
+          # Set current week with fallback
+          CURRENT_WEEK="${{ needs.preflight-intelligence.outputs.current_week }}"
+          if [ -z "$CURRENT_WEEK" ]; then
+            CURRENT_WEEK="5"
+            echo "⚠️ Using fallback week: $CURRENT_WEEK"
+          else
+            echo "Week: $CURRENT_WEEK"
+          fi
+          
+          # Execute intelligence based on mode
+          case "${{ matrix.mode }}" in
+            "full")
+              echo "🚀 Running full advanced intelligence analysis..."
+              node dist/cli.js intelligence --mode full --week $CURRENT_WEEK
+              ;;
+            "realtime")
+              echo "⚡ Running real-time intelligence monitoring..."
+              node dist/cli.js realtime
+              ;;
+            "learning")
+              echo "🧠 Running adaptive learning cycle..."
+              node dist/cli.js learning
+              ;;
+            "analytics")
+              echo "📊 Generating advanced analytics dashboard..."
+              node dist/cli.js analytics
+              ;;
+            "seasonal")
+              echo "🔮 Processing multi-season intelligence..."
+              node dist/cli.js seasonal
+              ;;
+            "emergency")
+              echo "🚨 Activating emergency intelligence protocols..."
+              node dist/cli.js emergency
+              ;;
+            *)
+              echo "❓ Unknown mode: ${{ matrix.mode }}, defaulting to full analysis"
+              node dist/cli.js intelligence --mode full --week $CURRENT_WEEK
+              ;;
+          esac
+          
+          echo "✅ Phase 4 Intelligence execution complete"
+
+      - name: Validate Intelligence Results
+        working-directory: fantasy-engine/automation
+        run: |
+          echo "🔍 Validating intelligence results..."
+          
+          # Check for critical output files
+          if [[ "${{ matrix.mode }}" == "full" || "${{ matrix.mode }}" == "analytics" ]]; then
+            if [[ -f "phase4_results.json" ]]; then
+              echo "✅ Phase 4 results file generated"
+              cat phase4_results.json | jq '.intelligence_summary'
+            else
+              echo "⚠️ Phase 4 results file missing"
+            fi
+          fi
+          
+          if [[ "${{ matrix.mode }}" == "realtime" || "${{ matrix.mode }}" == "emergency" ]]; then
+            if [[ -f "urgent_decisions.json" ]]; then
+              echo "✅ Urgent decisions file generated"
+              cat urgent_decisions.json | jq 'length'
+            fi
+          fi
+          
+          if [[ "${{ matrix.mode }}" == "learning" ]]; then
+            if [[ -f "learning_patterns.json" ]]; then
+              echo "✅ Learning patterns updated"
+              cat learning_patterns.json | jq '.metrics'
+            fi
+          fi
+          
+          if [[ "${{ matrix.mode }}" == "analytics" ]]; then
+            if [[ -f "analytics_dashboard.json" ]]; then
+              echo "✅ Analytics dashboard generated"
+              cat analytics_dashboard.json | jq '.summary.overall_grade'
+            fi
+          fi
+
+      - name: Upload Intelligence Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: phase4-intelligence-results-${{ matrix.mode }}-${{ github.run_number }}
+          path: |
+            fantasy-engine/automation/phase4_results.json
+            fantasy-engine/automation/urgent_decisions.json
+            fantasy-engine/automation/learning_patterns.json
+            fantasy-engine/automation/seasonal_intelligence.json
+            fantasy-engine/automation/analytics_dashboard.json
+            fantasy-engine/automation/analytics_dashboard_*.html
+            fantasy-engine/automation/system-metrics.json
+            fantasy-engine/automation/health-report.txt
+          retention-days: 30
+
+      - name: Store Intelligence Data
+        if: matrix.primary == true
+        working-directory: fantasy-engine/automation
+        run: |
+          echo "💾 Storing intelligence data for future analysis..."
+          
+          # In production, this would save to persistent database
+          # For now, demonstrate data structure
+          if [[ -f "phase4_results.json" ]]; then
+            echo "Storing Phase 4 results..."
+            mkdir -p ../shared/data/intelligence
+            cp phase4_results.json "../shared/data/intelligence/phase4_$(date +%Y%m%d_%H%M%S).json"
+          fi
+
+  # Advanced notification system for Phase 4 results
+  intelligent-notifications:
+    runs-on: ubuntu-latest
+    needs: [preflight-intelligence, advanced-intelligence]
+    if: always() && needs.preflight-intelligence.outputs.should_run == 'true'
+    timeout-minutes: 5
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download Intelligence Results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: phase4-intelligence-results-*
+          merge-multiple: true
+          path: ./results
+
+      - name: Send Intelligent Notifications
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          echo "📢 Sending Phase 4 intelligence notifications..."
+          
+          # Determine notification level based on results
+          MODE="${{ needs.preflight-intelligence.outputs.intelligence_mode }}"
+          WEEK="${{ needs.preflight-intelligence.outputs.current_week }}"
+          
+          # Fallback if week is empty
+          if [[ -z "$WEEK" ]]; then
+            WEEK=$(node -e "
+              const now = new Date();
+              const seasonStart = new Date(now.getFullYear(), 8, 1);
+              const weeksSinceStart = Math.floor((now.getTime() - seasonStart.getTime()) / (7 * 24 * 60 * 60 * 1000));
+              console.log(Math.max(1, Math.min(18, weeksSinceStart + 1)));
+            ")
+            echo "⚠️ Using fallback week calculation: $WEEK"
+          fi
+          
+          if [[ "${{ needs.advanced-intelligence.result }}" == "success" ]]; then
+            STATUS="✅ SUCCESS"
+            COLOR="3066993"  # Green
+          elif [[ "${{ needs.advanced-intelligence.result }}" == "failure" ]]; then
+            STATUS="❌ FAILED"
+            COLOR="15158332"  # Red
+          else
+            STATUS="⚠️ PARTIAL"
+            COLOR="16776960"  # Yellow
+          fi
+          
+          # Extract key insights and data verification info if available
+          INSIGHTS=""
+          URGENT_ACTIONS=""
+          NEXT_ACTIONS=""
+          GRADE=""
+          DATA_VERIFICATION=""
+          FULL_LLM_RESPONSE=""
+          
+          # Check multiple possible locations for the results file
+          RESULTS_FILE=""
+          if [[ -f "results/phase4_results.json" ]]; then
+            RESULTS_FILE="results/phase4_results.json"
+          elif [[ -f "fantasy-engine/automation/phase4_results.json" ]]; then
+            RESULTS_FILE="fantasy-engine/automation/phase4_results.json"
+          fi
+          
+          if [[ -n "$RESULTS_FILE" ]]; then
+            echo "📄 Found results file: $RESULTS_FILE"
+            
+            # Check if this is an error result
+            ERROR_MSG=$(cat "$RESULTS_FILE" | jq -r '.error // empty' 2>/dev/null)
+            
+            if [[ -n "$ERROR_MSG" ]]; then
+              # Handle error format
+              INSIGHTS="🚨 System Error: $ERROR_MSG"
+              URGENT_ACTIONS=$(cat "$RESULTS_FILE" | jq -r '.urgent_actions[]?' 2>/dev/null)
+              NEXT_ACTIONS=$(cat "$RESULTS_FILE" | jq -r '.next_actions[]?' 2>/dev/null)
+              GRADE=$(cat "$RESULTS_FILE" | jq -r '.performance_grade' 2>/dev/null || echo "F")
+              
+              # Extract data verification info for error context
+              ESPN_AUTH=$(cat "$RESULTS_FILE" | jq -r '.data_verification.espn_authenticated // false' 2>/dev/null)
+              FANTASYPROS_AUTH=$(cat "$RESULTS_FILE" | jq -r '.data_verification.fantasypros_authenticated // false' 2>/dev/null)
+              LLM_PROVIDER=$(cat "$RESULTS_FILE" | jq -r '.data_verification.llm_provider // "Unknown"' 2>/dev/null)
+              LLM_MODEL=$(cat "$RESULTS_FILE" | jq -r '.data_verification.llm_model // "Unknown"' 2>/dev/null)
+              LLM_INIT=$(cat "$RESULTS_FILE" | jq -r '.data_verification.llm_initialized // false' 2>/dev/null)
+              
+              # Add error context if available
+              ERROR_TYPE=$(cat "$RESULTS_FILE" | jq -r '.error_context.error_type // empty' 2>/dev/null)
+              POSSIBLE_CAUSES=$(cat "$RESULTS_FILE" | jq -r '.error_context.possible_causes[]? // empty' 2>/dev/null)
+              if [[ -n "$ERROR_TYPE" ]]; then
+                INSIGHTS="$INSIGHTS"$'\n'"**Error Type**: $ERROR_TYPE"
+              fi
+              if [[ -n "$POSSIBLE_CAUSES" ]]; then
+                INSIGHTS="$INSIGHTS"$'\n'"**Possible Causes**: $(echo "$POSSIBLE_CAUSES" | tr '\n' ', ' | sed 's/, $//')"
+              fi
+            else
+              # Handle normal success format
+              INSIGHTS=$(cat "$RESULTS_FILE" | jq -r '.insights.key_insights[]? // .key_insights[]?' 2>/dev/null || echo "Analysis complete")
+              URGENT_ACTIONS=$(cat "$RESULTS_FILE" | jq -r '.insights.urgent_actions[]? // .urgent_actions[]?' 2>/dev/null || echo "")
+              NEXT_ACTIONS=$(cat "$RESULTS_FILE" | jq -r '.insights.next_actions[]? // .next_actions[]?' 2>/dev/null || echo "")
+              GRADE=$(cat "$RESULTS_FILE" | jq -r '.insights.performance_grade // .performance_grade' 2>/dev/null || echo "N/A")
+              
+              # Extract full LLM response for complete transparency
+              echo "🔍 Debugging LLM response extraction from JSON..."
+              
+              # Show the structure of the JSON for debugging
+              echo "JSON structure preview:"
+              cat "$RESULTS_FILE" | jq 'keys' 2>/dev/null
+              
+              # Show what's in summary array
+              echo "Summary array contents:"
+              cat "$RESULTS_FILE" | jq '.summary[]' 2>/dev/null | head -2
+              
+              # Try to combine BOTH league responses first
+              echo "Attempting to combine both league responses..."
+              LEAGUE_1_RESPONSE=$(cat "$RESULTS_FILE" | jq -r '.summary[0].fullLLMResponse // empty' 2>/dev/null)
+              LEAGUE_2_RESPONSE=$(cat "$RESULTS_FILE" | jq -r '.summary[1].fullLLMResponse // empty' 2>/dev/null)
+              
+              echo "League 1 response: ${#LEAGUE_1_RESPONSE} characters"
+              echo "League 2 response: ${#LEAGUE_2_RESPONSE} characters"
+              
+              if [[ -n "$LEAGUE_1_RESPONSE" && -n "$LEAGUE_2_RESPONSE" ]]; then
+                # Get league names for headers
+                LEAGUE_1_NAME=$(cat "$RESULTS_FILE" | jq -r '.summary[0].league // "Main League"' 2>/dev/null)
+                LEAGUE_2_NAME=$(cat "$RESULTS_FILE" | jq -r '.summary[1].league // "Secondary League"' 2>/dev/null)
+                
+                FULL_LLM_RESPONSE="**📊 ${LEAGUE_1_NAME}:**"$'\n\n'"${LEAGUE_1_RESPONSE}"$'\n\n'"**📊 ${LEAGUE_2_NAME}:**"$'\n\n'"${LEAGUE_2_RESPONSE}"
+                echo "✅ Combined both leagues: ${#FULL_LLM_RESPONSE} total characters"
+              elif [[ -n "$LEAGUE_1_RESPONSE" ]]; then
+                FULL_LLM_RESPONSE="$LEAGUE_1_RESPONSE"
+                echo "Using League 1 only: ${#FULL_LLM_RESPONSE} characters"
+              elif [[ -n "$LEAGUE_2_RESPONSE" ]]; then
+                FULL_LLM_RESPONSE="$LEAGUE_2_RESPONSE"
+                echo "Using League 2 only: ${#FULL_LLM_RESPONSE} characters"
+              fi
+              
+              if [[ -z "$FULL_LLM_RESPONSE" ]]; then
+                FULL_LLM_RESPONSE=$(cat "$RESULTS_FILE" | jq -r '.analysis_results.leagues[0].analysis.summary.fullLLMResponse // empty' 2>/dev/null)
+                echo "Path 3 (.analysis_results.leagues[0].analysis.summary.fullLLMResponse): Found ${#FULL_LLM_RESPONSE} characters"
+              fi
+              
+              if [[ -z "$FULL_LLM_RESPONSE" ]]; then
+                FULL_LLM_RESPONSE=$(cat "$RESULTS_FILE" | jq -r '.analysis_results.leagues[0].analysis.recommendations[0].analysis // empty' 2>/dev/null)
+                echo "Path 4 (.analysis_results.leagues[0].analysis.recommendations[0].analysis): Found ${#FULL_LLM_RESPONSE} characters"
+              fi
+              
+              if [[ -z "$FULL_LLM_RESPONSE" ]]; then
+                FULL_LLM_RESPONSE=$(cat "$RESULTS_FILE" | jq -r '.insights.analysis // empty' 2>/dev/null)
+                echo "Path 5 (.insights.analysis): Found ${#FULL_LLM_RESPONSE} characters"
+              fi
+              
+              if [[ -z "$FULL_LLM_RESPONSE" ]]; then
+                FULL_LLM_RESPONSE=$(cat "$RESULTS_FILE" | jq -r '.recommendations[0].analysis // empty' 2>/dev/null)
+                echo "Path 6 (.recommendations[0].analysis): Found ${#FULL_LLM_RESPONSE} characters"
+              fi
+              
+              if [[ -z "$FULL_LLM_RESPONSE" ]]; then
+                FULL_LLM_RESPONSE=$(cat "$RESULTS_FILE" | jq -r '.leagues[0].analysis // empty' 2>/dev/null)
+                echo "Path 7 (.leagues[0].analysis): Found ${#FULL_LLM_RESPONSE} characters"
+              fi
+              
+              # If still empty, try to get from any analysis field in the JSON
+              if [[ -z "$FULL_LLM_RESPONSE" ]]; then
+                echo "Trying deep search for LLM response content..."
+                FULL_LLM_RESPONSE=$(cat "$RESULTS_FILE" | jq -r '.. | select(type == "string" and length > 500 and (contains("QB") or contains("RB") or contains("WR") or contains("**") or contains("Recommendation"))) | select(. != null) // empty' 2>/dev/null | head -1)
+                echo "Deep search: Found ${#FULL_LLM_RESPONSE} characters"
+              fi
+              
+              # Skip - combination logic moved to the top
+              
+              if [[ -z "$FULL_LLM_RESPONSE" ]]; then
+                echo "❌ No complete LLM response found in JSON structure"
+                echo "Available keys in the JSON:"
+                cat "$RESULTS_FILE" | jq -r 'paths(scalars) as $p | $p | join(".")' 2>/dev/null | head -20
+              else
+                echo "✅ Found complete LLM response: ${#FULL_LLM_RESPONSE} characters"
+              fi
+              
+              # Extract data verification info for success case
+              ESPN_AUTH=$(cat "$RESULTS_FILE" | jq -r '.data_verification.espn_authenticated // false' 2>/dev/null)
+              FANTASYPROS_AUTH=$(cat "$RESULTS_FILE" | jq -r '.data_verification.fantasypros_authenticated // false' 2>/dev/null)
+              LLM_PROVIDER=$(cat "$RESULTS_FILE" | jq -r '.data_verification.llm_provider // "Unknown"' 2>/dev/null)
+              LLM_MODEL=$(cat "$RESULTS_FILE" | jq -r '.data_verification.llm_model // "Unknown"' 2>/dev/null)
+              LLM_INIT=$(cat "$RESULTS_FILE" | jq -r '.data_verification.llm_initialized // false' 2>/dev/null)
+            fi
+            
+            # Build data verification status
+            ESPN_STATUS="❌"
+            if [[ "$ESPN_AUTH" == "true" ]]; then
+              ESPN_STATUS="✅"
+            fi
+            
+            FANTASYPROS_STATUS="❌" 
+            if [[ "$FANTASYPROS_AUTH" == "true" ]]; then
+              FANTASYPROS_STATUS="✅"
+            fi
+            
+            LLM_STATUS="❌"
+            if [[ "$LLM_INIT" == "true" ]]; then
+              LLM_STATUS="✅"
+            fi
+            
+            DATA_VERIFICATION="**Data Sources:**"$'\n'"$ESPN_STATUS ESPN Fantasy API"$'\n'"$FANTASYPROS_STATUS FantasyPros Expert Rankings"$'\n'"$LLM_STATUS $LLM_PROVIDER ($LLM_MODEL)"
+          else
+            echo "⚠️ No results file found in expected locations"
+          fi
+          
+          
+          # Function to send Discord messages in chunks
+          send_discord_messages() {
+            local content="$1"
+            local title="$2"
+            local status="$3"
+            local color="$4"
+            local mode="$5"
+            local week="$6"
+            local grade="$7"
+            local footer="$8"
+            local timestamp="$9"
+            
+            # Discord embed description limit is 4096 characters
+            local max_length=3900  # Leave some buffer for formatting
+            local content_length=${#content}
+            
+            echo "📝 Content length: $content_length chars, Discord limit: 4096"
+            
+            if [[ $content_length -le $max_length ]]; then
+              # Single message - fits in one embed
+              echo "📨 Sending single Discord message ($content_length chars)"
+              jq -n \
+                --arg title "$title" \
+                --arg description "$content" \
+                --argjson color "$color" \
+                --arg mode "$mode" \
+                --arg week "$week" \
+                --arg grade "$grade" \
+                --arg footer "$footer" \
+                --arg timestamp "$timestamp" \
+                '{
+                  embeds: [{
+                    title: $title,
+                    description: $description,
+                    color: $color,
+                    fields: [
+                      {name: "🎯 Intelligence Mode", value: $mode, inline: true},
+                      {name: "📅 NFL Week", value: $week, inline: true},
+                      {name: "🏆 Performance Grade", value: $grade, inline: true}
+                    ],
+                    footer: {text: $footer},
+                    timestamp: $timestamp
+                  }]
+                }' | curl -X POST "$DISCORD_WEBHOOK_URL" -H "Content-Type: application/json" -d @-
+            else
+              # Multiple messages needed
+              echo "📨 Sending multiple Discord messages (content too long: $content_length chars)"
+              
+              # Send header message first
+              jq -n \
+                --arg title "$title" \
+                --arg description "📊 **Fantasy Football Analysis - Week $week**" \
+                --argjson color "$color" \
+                --arg mode "$mode" \
+                --arg week "$week" \
+                --arg grade "$grade" \
+                --arg footer "$footer" \
+                --arg timestamp "$timestamp" \
+                '{
+                  embeds: [{
+                    title: $title,
+                    description: $description,
+                    color: $color,
+                    fields: [
+                      {name: "🎯 Intelligence Mode", value: $mode, inline: true},
+                      {name: "📅 NFL Week", value: $week, inline: true},
+                      {name: "🏆 Performance Grade", value: $grade, inline: true}
+                    ],
+                    footer: {text: $footer},
+                    timestamp: $timestamp
+                  }]
+                }' | curl -X POST "$DISCORD_WEBHOOK_URL" -H "Content-Type: application/json" -d @-
+              
+              # Sleep briefly between messages
+              sleep 1
+              
+              # Split content into chunks and send
+              local remaining_content="$content"
+              local part_num=1
+              
+              while [[ ${#remaining_content} -gt 0 ]]; do
+                local chunk=""
+                
+                if [[ ${#remaining_content} -le $max_length ]]; then
+                  # Last chunk
+                  chunk="$remaining_content"
+                  remaining_content=""
+                else
+                  # Find a good break point (prefer breaking at paragraph or section)
+                  local temp_chunk="${remaining_content:0:$max_length}"
+                  local break_point=$max_length
+                  
+                  # Simple approach: find the last space or newline to avoid breaking words
+                  local search_start=$((max_length - 200))  # Look in last 200 chars for good break
+                  if [[ $search_start -lt 0 ]]; then
+                    search_start=0
+                  fi
+                  
+                  # Look backwards from max_length for a good break point
+                  for ((i=max_length; i>=search_start; i--)); do
+                    local char="${remaining_content:$i:1}"
+                    if [[ "$char" == $'\n' ]] || [[ "$char" == " " ]] || [[ "$char" == "." ]] || [[ "$char" == "!" ]] || [[ "$char" == "?" ]]; then
+                      break_point=$((i + 1))
+                      break
+                    fi
+                  done
+                  
+                  chunk="${remaining_content:0:$break_point}"
+                  remaining_content="${remaining_content:$break_point}"
+                fi
+                
+                echo "📨 Sending part $part_num (${#chunk} chars)"
+                
+                # Send the chunk
+                jq -n \
+                  --arg description "$chunk" \
+                  --argjson color "$color" \
+                  '{
+                    embeds: [{
+                      description: $description,
+                      color: $color
+                    }]
+                  }' | curl -X POST "$DISCORD_WEBHOOK_URL" -H "Content-Type: application/json" -d @-
+                
+                part_num=$((part_num + 1))
+                
+                # Brief pause between chunks
+                if [[ ${#remaining_content} -gt 0 ]]; then
+                  sleep 1
+                fi
+              done
+            fi
+          }
+          
+          # Build description content - PRIORITIZE full LLM response
+          DESCRIPTION=""
+          
+          # Check if we have the full LLM response
+          if [[ -n "$FULL_LLM_RESPONSE" && ${#FULL_LLM_RESPONSE} -gt 50 ]]; then
+            echo "✅ Using FULL LLM RESPONSE for Discord (${#FULL_LLM_RESPONSE} chars)"
+            DESCRIPTION="$FULL_LLM_RESPONSE"
+          else
+            echo "⚠️ No full LLM response found, using fallback insights"
+            # Fallback if no full response available
+            DESCRIPTION="**Mode**: $MODE | **Week**: $WEEK | **Grade**: $GRADE"
+            if [[ -n "$INSIGHTS" ]]; then
+              DESCRIPTION="$DESCRIPTION"$'\n\n📊 **Analysis Summary:**'
+              while IFS= read -r line; do
+                DESCRIPTION="$DESCRIPTION"$'\n• '"$line"
+              done <<< "$INSIGHTS"
+            fi
+            
+            # Add additional sections for fallback
+            if [[ -n "$URGENT_ACTIONS" ]]; then
+              DESCRIPTION="$DESCRIPTION"$'\n\n🚨 **Urgent Actions:**'
+              while IFS= read -r line; do
+                DESCRIPTION="$DESCRIPTION"$'\n• '"$line"
+              done <<< "$URGENT_ACTIONS"
+            fi
+            
+            if [[ -n "$NEXT_ACTIONS" ]]; then
+              DESCRIPTION="$DESCRIPTION"$'\n\n📋 **Next Steps:**'
+              while IFS= read -r line; do
+                DESCRIPTION="$DESCRIPTION"$'\n• '"$line"
+              done <<< "$NEXT_ACTIONS"
+            fi
+            
+            if [[ -n "$DATA_VERIFICATION" ]]; then
+              DESCRIPTION="$DESCRIPTION"$'\n\n'"$DATA_VERIFICATION"
+            fi
+          fi
+          
+          # Send Discord notifications with chunking support
+          if [[ -n "$DISCORD_WEBHOOK_URL" ]]; then
+            FOOTER_TEXT="Fantasy AI Phase 4 Advanced Intelligence • $(date +'%b %d, %Y at %I:%M %p UTC')"
+            TIMESTAMP_VALUE="$(date -Iseconds)"
+            
+            send_discord_messages "$DESCRIPTION" "🧠 Phase 4 Advanced Intelligence - $STATUS" "$STATUS" "$COLOR" "$MODE" "$WEEK" "$GRADE" "$FOOTER_TEXT" "$TIMESTAMP_VALUE"
+          fi
+          
+          echo "📨 Notifications sent successfully"
+
+  # Create issues for failed intelligence operations
+  create-intelligence-issue:
+    runs-on: ubuntu-latest
+    needs: [preflight-intelligence, advanced-intelligence]
+    if: always() && needs.advanced-intelligence.result == 'failure' && needs.preflight-intelligence.outputs.should_run == 'true'
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Create Intelligence Failure Issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const mode = '${{ needs.preflight-intelligence.outputs.intelligence_mode }}';
+            const week = '${{ needs.preflight-intelligence.outputs.current_week }}';
+            const runUrl = `https://github.com/` + context.repo.owner + `/` + context.repo.repo + `/actions/runs/` + context.runId;
+            
+            const title = '🧠 Phase 4 Intelligence Failure - ' + mode.toUpperCase() + ' Mode (Week ' + week + ')';
+            const body = '## 🚨 Phase 4 Advanced Intelligence Failure\n\n' +
+              '**Intelligence Mode**: ' + mode + '\n' +
+              '**NFL Week**: ' + week + '\n' +
+              '**Execution Time**: ' + new Date().toISOString() + '\n' +
+              '**Workflow Run**: [' + context.runId + '](' + runUrl + ')\n\n' +
+              '### Failure Details\n' +
+              'The Phase 4 advanced intelligence system encountered a failure during execution.\n\n' +
+              '### Troubleshooting Steps\n' +
+              '1. **Check LLM API Keys**: Verify all configured LLM providers are accessible\n' +
+              '2. **Validate ESPN Cookies**: Ensure ESPN_S2 and ESPN_SWID are current\n' +
+              '3. **Review Cost Limits**: Check if daily/weekly cost limits were exceeded\n' +
+              '4. **Intelligence Data**: Verify intelligence data files are accessible\n' +
+              '5. **Network Connectivity**: Ensure external API access is available\n\n' +
+              '### Intelligence Components\n' +
+              '- **Real-time Engine**: Event monitoring and instant decisions\n' +
+              '- **Adaptive Learning**: Pattern recognition and strategy evolution\n' +
+              '- **Analytics Engine**: Performance analysis and insights\n' +
+              '- **Seasonal Intelligence**: Multi-season pattern analysis\n\n' +
+              '### Next Actions\n' +
+              '- [ ] Review workflow logs for specific error details\n' +
+              '- [ ] Test individual intelligence components\n' +
+              '- [ ] Verify all required environment variables\n' +
+              '- [ ] Check intelligence data consistency\n' +
+              '- [ ] Run manual intelligence validation\n\n' +
+              '**Auto-created by Phase 4 Intelligence Workflow**';
+            
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: ['phase-4', 'intelligence', 'automation', 'bug']
+            });

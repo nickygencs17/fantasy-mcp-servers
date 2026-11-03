@@ -1,0 +1,15 @@
+[Unit]
+Description=Beer-Sheet VBD Draft Board MCP Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/beer-sheet-mcp
+# MCP_HTTP_PORT and MCP_AUTH_TOKEN live here, outside the repo (chmod 600)
+EnvironmentFile=/etc/fantasy-mcp/beer-sheet.env
+ExecStart=/usr/bin/node /opt/beer-sheet-mcp/index.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
