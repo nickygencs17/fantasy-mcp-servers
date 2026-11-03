@@ -70,6 +70,9 @@ mcp = FastMCP(
     "espn-fantasy-football",
     host="0.0.0.0",
     port=int(MCP_HTTP_PORT) if MCP_HTTP_PORT else 8000,
+    # Plain JSON replies and no session bookkeeping: less overhead per call
+    json_response=True,
+    stateless_http=True,
 )
 
 _league_cache: Optional[League] = None
@@ -103,7 +106,11 @@ CACHE_DIR = Path(os.environ.get("DRAFT_CACHE_DIR", Path(__file__).resolve().pare
 PLAYER_CACHE_FILE = CACHE_DIR / f"players-{LEAGUE_ID}-{YEAR}.json"
 PLAYER_POOL_SIZE = int(os.environ.get("DRAFT_POOL_SIZE", "400"))
 PLAYER_CACHE_MAX_AGE = 6 * 3600  # background refresh interval (injuries change)
-DRAFT_STATE_TTL = 3  # seconds; the live feed is small, so stay close to real time
+# Live picks are polled in the background so tool calls never wait on ESPN:
+# every 2s while a draft is live or about to start, every 30s otherwise.
+DRAFT_POLL_LIVE = 2
+DRAFT_POLL_IDLE = 30
+DRAFT_STATE_MAX_AGE = 45  # older than this (poller stalled) = fetch inline
 # Test hook: pretend only the first N picks of a finished draft have happened,
 # so the live-draft logic can be exercised outside draft day.
 SIMULATE_PICKS = os.environ.get("DRAFT_SIMULATE_PICKS")
@@ -316,10 +323,38 @@ def _background_refresh() -> None:
 
 
 def draft_state(force: bool = False) -> dict:
-    """Live picks + draft order from ESPN's mDraftDetail feed, cached briefly."""
+    """Latest live picks. Normally served from memory, kept fresh by
+    _draft_poller; only fetches inline if the poller has fallen behind."""
+    if force or not _draft_state or time.time() - _draft_state_at > DRAFT_STATE_MAX_AGE:
+        return _fetch_draft_state()
+    return _draft_state
+
+
+def _draft_is_hot(state: Optional[dict]) -> bool:
+    """Live, or starting within 15 minutes (or past its start time but not
+    flagged yet): poll fast so the first picks show up right away."""
+    if not state:
+        return True
+    if state["drafted"]:
+        return False
+    if state["in_progress"]:
+        return True
+    start = (state.get("scheduled") or 0) / 1000
+    return bool(start) and time.time() > start - 15 * 60
+
+
+def _draft_poller() -> None:
+    while True:
+        try:
+            _fetch_draft_state()
+        except Exception as exc:  # keep serving the last good state
+            print(f"draft poll failed: {exc}", flush=True)
+        time.sleep(DRAFT_POLL_LIVE if _draft_is_hot(_draft_state) else DRAFT_POLL_IDLE)
+
+
+def _fetch_draft_state() -> dict:
+    """Live picks + draft order from ESPN's mDraftDetail feed (~50 KB)."""
     global _draft_state, _draft_state_at
-    if not force and _draft_state and time.time() - _draft_state_at < DRAFT_STATE_TTL:
-        return _draft_state
     data = _espn_get(LEAGUE_URL, [("view", "mDraftDetail"), ("view", "mSettings")])
     detail = data.get("draftDetail", {})
     settings = data.get("settings", {})
@@ -333,7 +368,7 @@ def draft_state(force: bool = False) -> dict:
         picks = picks[: int(SIMULATE_PICKS)]
         drafted, in_progress = False, True
     rounds = sum(_slot_counts(settings).values()) + settings.get("rosterSettings", {}).get("lineupSlotCounts", {}).get("20", 0)
-    _draft_state = {
+    state = {
         "picks": picks,
         "drafted": drafted,
         "in_progress": in_progress,
@@ -343,9 +378,9 @@ def draft_state(force: bool = False) -> dict:
         "seconds_per_pick": draft_settings.get("timePerSelection"),
         "scheduled": draft_settings.get("date"),
     }
-    _draft_state_at = time.time()
     _ensure_players([p["playerId"] for p in picks])
-    return _draft_state
+    _draft_state, _draft_state_at = state, time.time()
+    return state
 
 
 def _team_for_pick(state: dict, overall: int) -> Optional[int]:
@@ -493,7 +528,10 @@ def get_draft_board(position: Optional[str] = None, limit: int = 15) -> dict:
     pick, who's on the clock, picks until your turn), your roster so far
     with the starting slots still open, and the best available players by
     value over replacement (VBD), plus the top few at each position. Player
-    data comes from the local cache, so this answers in well under a second.
+    data comes from the local cache and live picks are polled in the
+    background, so this answers in milliseconds. vbd = projected points over
+    the last league-wide starter at that position; picks_past_adp > 0 means
+    he's lasting longer than drafters usually let him.
 
     Args:
         position: only show this position in best_available (QB, RB, WR, TE, D/ST, K).
@@ -523,8 +561,7 @@ def get_draft_board(position: Optional[str] = None, limit: int = 15) -> dict:
         "best_available": [_board_entry(p, next_pick) for p in ranked[:limit]],
         "top_by_position": by_position,
         "player_data_as_of": cache["built_at"],
-        "note": "vbd = projected points over the last league-wide starter at that position; "
-                "picks_past_adp > 0 means he's lasting longer than drafters usually let him.",
+        "picks_as_of_seconds_ago": round(time.time() - _draft_state_at, 1),
     }
 
 
@@ -769,6 +806,7 @@ class BearerAuthMiddleware:
 
 if __name__ == "__main__":
     threading.Thread(target=_background_refresh, daemon=True).start()
+    threading.Thread(target=_draft_poller, daemon=True).start()
     if MCP_HTTP_PORT:
         import uvicorn
 
