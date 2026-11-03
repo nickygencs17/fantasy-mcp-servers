@@ -3,6 +3,7 @@ JayMishra-source (https://github.com/JayMishra-source/Fantasy-Football-AI-CoMana
 which its README states is released under the MIT License.
 
 Changes in this repository: new league tools (fantasy-engine/mcp-server/src/tools/league.ts),
+trade values and a rewritten trade analysis (fantasy-engine/mcp-server/src/tools/tradeValues.ts and trades.ts),
 a cached ESPN request helper and player name search in
 fantasy-engine/mcp-server/src/services/espnApi.ts, and the corresponding tool
 registrations in fantasy-engine/mcp-server/src/index-new.ts.

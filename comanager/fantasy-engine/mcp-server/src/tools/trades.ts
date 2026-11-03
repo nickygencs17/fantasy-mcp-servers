@@ -1,5 +1,6 @@
 import { espnApi } from '../services/espnApi.js';
 import { Player, TradeAnalysis } from '../types/espn.js';
+import { evaluateTrade } from './tradeValues.js';
 
 export interface TradeProposal {
   giving: Player[];
@@ -8,123 +9,16 @@ export interface TradeProposal {
   partnerTeamId?: string;
 }
 
+// Trades are judged by tools/tradeValues.ts: rest-of-season trade values
+// plus each team's best-lineup change. Output keeps the TradeAnalysis fields.
 export async function analyzeTradesTool(args: {
   leagueId: string;
   teamId: string;
   giving: string[]; // Player names
   receiving: string[]; // Player names
-}): Promise<TradeAnalysis> {
-  const { leagueId, teamId, giving, receiving } = args;
-  
-  if (!leagueId || !teamId || !giving?.length || !receiving?.length) {
-    throw new Error('League ID, Team ID, and trade players are required');
-  }
-  
+}): Promise<TradeAnalysis & Record<string, unknown>> {
   try {
-    // Find players being given
-    const givingPlayers: Player[] = [];
-    for (const playerName of giving) {
-      const player = await espnApi.findPlayerByName(leagueId, playerName);
-      if (player) {
-        givingPlayers.push(player);
-      } else {
-        throw new Error(`Player "${playerName}" not found`);
-      }
-    }
-    
-    // Find players being received
-    const receivingPlayers: Player[] = [];
-    for (const playerName of receiving) {
-      const player = await espnApi.findPlayerByName(leagueId, playerName);
-      if (player) {
-        receivingPlayers.push(player);
-      } else {
-        throw new Error(`Player "${playerName}" not found`);
-      }
-    }
-    
-    // Calculate trade values
-    const givingValue = givingPlayers.reduce((sum, p) => {
-      let value = (p.projectedPoints || 0) * 2; // Base value
-      if (p.percentOwned && p.percentOwned > 80) value *= 1.2; // Premium for elite players
-      if (p.injuryStatus && p.injuryStatus !== 'ACTIVE') value *= 0.7; // Discount for injuries
-      return sum + value;
-    }, 0);
-    
-    const receivingValue = receivingPlayers.reduce((sum, p) => {
-      let value = (p.projectedPoints || 0) * 2;
-      if (p.percentOwned && p.percentOwned > 80) value *= 1.2;
-      if (p.injuryStatus && p.injuryStatus !== 'ACTIVE') value *= 0.7;
-      return sum + value;
-    }, 0);
-    
-    const valueDiff = receivingValue - givingValue;
-    const fairnessRating = Math.max(0, Math.min(100, 50 + (valueDiff * 2)));
-    
-    // Determine recommendation
-    let recommendation: 'accept' | 'reject' | 'counter';
-    let reasoning = '';
-    
-    if (valueDiff > 10) {
-      recommendation = 'accept';
-      reasoning = 'Trade heavily favors you';
-    } else if (valueDiff > 0) {
-      recommendation = 'accept';
-      reasoning = 'Slight value gain in your favor';
-    } else if (valueDiff > -5) {
-      recommendation = 'counter';
-      reasoning = 'Close to fair value, but you could get more';
-    } else {
-      recommendation = 'reject';
-      reasoning = 'Trade favors the other team';
-    }
-    
-    // Analyze positional impact
-    const givingPositions = givingPlayers.map(p => p.position);
-    const receivingPositions = receivingPlayers.map(p => p.position);
-    
-    let immediateImpact = '';
-    let restOfSeasonImpact = '';
-    
-    // Check if trading away key positions
-    if (givingPositions.includes('RB') && !receivingPositions.includes('RB')) {
-      immediateImpact = 'Losing RB depth could hurt immediately';
-    } else if (receivingPositions.includes('RB') && !givingPositions.includes('RB')) {
-      immediateImpact = 'Gaining RB help addresses key need';
-    } else {
-      immediateImpact = 'Balanced positional exchange';
-    }
-    
-    // Rest of season projection
-    const givingRestOfSeason = givingPlayers.reduce((sum, p) => sum + ((p.projectedPoints || 0) * 10), 0);
-    const receivingRestOfSeason = receivingPlayers.reduce((sum, p) => sum + ((p.projectedPoints || 0) * 10), 0);
-    
-    if (receivingRestOfSeason > givingRestOfSeason * 1.1) {
-      restOfSeasonImpact = 'Significant upgrade for playoff push';
-    } else if (receivingRestOfSeason > givingRestOfSeason) {
-      restOfSeasonImpact = 'Modest improvement long-term';
-    } else {
-      restOfSeasonImpact = 'Potential downgrade in total points';
-    }
-    
-    // Add detailed reasoning
-    const detailedReasoning = [
-      reasoning,
-      `Value difference: ${valueDiff > 0 ? '+' : ''}${valueDiff.toFixed(1)} points`,
-      `Giving: ${givingPlayers.map(p => `${p.fullName} (${p.projectedPoints})`).join(', ')}`,
-      `Getting: ${receivingPlayers.map(p => `${p.fullName} (${p.projectedPoints})`).join(', ')}`
-    ].join('. ');
-    
-    return {
-      tradeScore: Math.round(valueDiff),
-      recommendation,
-      reasoning: detailedReasoning,
-      fairnessRating: Math.round(fairnessRating),
-      impact: {
-        immediate: immediateImpact,
-        restOfSeason: restOfSeasonImpact
-      }
-    };
+    return await evaluateTrade(args);
   } catch (error: any) {
     throw new Error(`Failed to analyze trade: ${error.message}`);
   }

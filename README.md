@@ -8,7 +8,7 @@ hostname, each behind its own bearer token.
 
 | Folder | Service | Port | Funnel path | Language | What it does |
 |---|---|---|---|---|---|
-| [`comanager/`](comanager/) | `espn-fantasy-comanager` | 8766 | `/comanager/mcp` | TypeScript | Rosters, lineup/start-sit, waivers, trades, plus league tools: standings, scoreboard, box scores, schedules, power rankings, playoff picture, clinch scenarios, activity, transactions, player cards, defense vs position, trending players |
+| [`comanager/`](comanager/) | `espn-fantasy-comanager` | 8766 | `/comanager/mcp` | TypeScript | Rosters, lineup/start-sit, waivers, trades, plus league tools: standings, scoreboard, box scores, schedules, power rankings, playoff picture, clinch scenarios, trade value chart with buy/sell signals and lineup-based trade analysis, activity, transactions, player cards, defense vs position, trending players |
 | [`draft/`](draft/) | `espn-fantasy-draft` | 8765 | `/mcp` | Python | Live draft: one-call `get_draft_board` (who's on the clock, your needs, best available by VBD) from a locally cached player pool plus ESPN's live pick feed; also league settings and matchup results |
 | [`injury-news/`](injury-news/) | `nfl-injury-news` | 8767 | `/injury-news/mcp` | Node | NFL injury report and news (ESPN public API, no key) |
 | [`odds/`](odds/) | `nfl-odds` | 8768 | `/odds/mcp` | Node | Spreads, totals, moneylines (ESPN public API, no key) |

@@ -26,6 +26,7 @@ import { getRosterTool, analyzeRosterTool } from './tools/roster.js';
 import { optimizeLineupTool, getStartSitAdviceTool } from './tools/lineup.js';
 import { findWaiverTargetsTool, analyzePlayerTool } from './tools/waiver.js';
 import { analyzeTradesTool, findTradeTargetsTool } from './tools/trades.js';
+import { getTradeValuesTool } from './tools/tradeValues.js';
 import {
   getStandingsTool,
   getLeagueTeamsTool,
@@ -175,7 +176,7 @@ const tools: Tool[] = [
   },
   {
     name: 'analyze_trade',
-    description: 'Analyze a proposed trade: which players you would give and receive',
+    description: 'Analyze a proposed trade (any number of players each way): rest-of-season trade values for every player, how each team\'s best starting lineup changes week by week (including the fantasy playoffs), and an accept/counter/reject verdict',
     inputSchema: {
       type: 'object',
       properties: {
@@ -346,6 +347,20 @@ const tools: Tool[] = [
     }
   },
   {
+    name: 'get_trade_values',
+    description: 'Trade value chart for this league (like the weekly r/fantasyfootball charts): every player\'s rest-of-season value on a 0-100 scale in this league\'s scoring, tier, rest-of-season and playoff-week projections, BUY/SELL/HOLD signals, and who rosters him',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        leagueId: { type: 'string', description: 'ESPN Fantasy league ID' },
+        teamId: { type: 'string', description: 'Optional, marks your players in the chart' },
+        position: { type: 'string', description: 'Optional: QB, RB, WR, TE or D/ST' },
+        limit: { type: 'number', description: 'Players in the chart (default 60, max 200)' }
+      },
+      required: ['leagueId']
+    }
+  },
+  {
     name: 'get_clinch_scenarios',
     description: 'How many wins lock a playoff spot: for every team, the final record that guarantees a spot in the worst case, playoff chances by final record from 20,000 season simulations, chance of a top-2 seed, and how many wins the last playoff seed usually needs',
     inputSchema: {
@@ -434,6 +449,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         break;
       case 'get_trending_players':
         result = await getTrendingPlayersTool(args as any);
+        break;
+      case 'get_trade_values':
+        result = await getTradeValuesTool(args as any);
         break;
       case 'get_clinch_scenarios':
         result = await getClinchScenariosTool(args as any);

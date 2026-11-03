@@ -5,7 +5,7 @@ import { espnApi } from '../services/espnApi.js';
 // position and trending players. All ESPN reads go through
 // espnApi.getLeagueData(), which caches identical requests for 60s.
 
-const POSITIONS: { [id: number]: string } = { 1: 'QB', 2: 'RB', 3: 'WR', 4: 'TE', 5: 'K', 16: 'D/ST' };
+export const POSITIONS: { [id: number]: string } = { 1: 'QB', 2: 'RB', 3: 'WR', 4: 'TE', 5: 'K', 16: 'D/ST' };
 const POSITION_IDS: { [pos: string]: number } = { QB: 1, RB: 2, WR: 3, TE: 4, K: 5, 'D/ST': 16, DST: 16 };
 // Lineup slot that a position fills, used for ESPN's filterSlotIds
 const POSITION_SLOT_IDS: { [pos: string]: number } = { QB: 0, RB: 2, WR: 4, TE: 6, K: 17, 'D/ST': 16, DST: 16 };
@@ -33,7 +33,7 @@ const ACTIVITY_MESSAGE_TYPES: { [id: number]: string } = {
   178: 'ADD (FA)', 180: 'ADD (waiver)', 179: 'DROP', 181: 'DROP', 239: 'DROP', 244: 'TRADE'
 };
 
-const round = (n: number | null | undefined, digits = 2): number | null =>
+export const round = (n: number | null | undefined, digits = 2): number | null =>
   n === null || n === undefined || Number.isNaN(n) ? null : Number(n.toFixed(digits));
 
 const isoDate = (ms: number | undefined): string | null => (ms ? new Date(ms).toISOString() : null);
@@ -53,7 +53,7 @@ function parseTeamId(teamId: string | number | undefined): number {
 // and the full season schedule with scores)
 // ---------------------------------------------------------------------------
 
-interface LeagueContext {
+export interface LeagueContext {
   raw: any;
   name: string;
   season: number;
@@ -68,7 +68,7 @@ interface LeagueContext {
   schedule: any[];
 }
 
-async function getLeagueContext(leagueId: string): Promise<LeagueContext> {
+export async function getLeagueContext(leagueId: string): Promise<LeagueContext> {
   requireLeague(leagueId);
   const raw = await espnApi.getLeagueData(leagueId, ['mTeam', 'mStandings', 'mSettings', 'mMatchupScore']);
   const members = new Map<string, string>(
@@ -98,7 +98,7 @@ async function getLeagueContext(leagueId: string): Promise<LeagueContext> {
   };
 }
 
-function teamName(ctx: LeagueContext, teamId: number): string {
+export function teamName(ctx: LeagueContext, teamId: number): string {
   return ctx.teams.get(teamId)?.name || `Team ${teamId}`;
 }
 
@@ -191,7 +191,7 @@ function statFor(player: any, source: number, scoringPeriodId: number, season?: 
 type ProGameIndex = Map<number, Map<number, { opponent: string; opponentId: number; kickoff: string | null }>>;
 
 // week -> proTeamId -> "vs KC" / "@KC"
-async function getProGameIndex(): Promise<{ games: ProGameIndex; abbrevs: Map<number, string>; byes: Map<number, number> }> {
+export async function getProGameIndex(): Promise<{ games: ProGameIndex; abbrevs: Map<number, string>; byes: Map<number, number> }> {
   const proTeams = await espnApi.getProTeamSchedules();
   const abbrevs = new Map<number, string>(proTeams.map((t: any) => [t.id, t.abbrev?.toUpperCase() || 'FA']));
   const byes = new Map<number, number>(proTeams.map((t: any) => [t.id, t.byeWeek]));
@@ -218,7 +218,7 @@ function opponentFor(index: ProGameIndex, week: number, proTeamId: number): stri
   return index.get(week)?.get(proTeamId)?.opponent || 'BYE';
 }
 
-function injuryLabel(player: any): string | undefined {
+export function injuryLabel(player: any): string | undefined {
   const status = player?.injuryStatus;
   return status && !['ACTIVE', 'NORMAL'].includes(status) ? status : undefined;
 }

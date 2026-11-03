@@ -445,7 +445,7 @@ export class ESPNApiService {
     return this.year;
   }
 
-  private cachedGet(url: string, filter?: object, withCookies = true): Promise<any> {
+  private cachedGet(url: string, filter?: object, withCookies = true, ttlMs = ESPNApiService.RESPONSE_CACHE_TTL_MS): Promise<any> {
     const filterJson = filter ? JSON.stringify(filter) : '';
     const key = `${url}|${filterJson}`;
     const now = Date.now();
@@ -483,7 +483,7 @@ export class ESPNApiService {
         throw new Error(`ESPN API Request Failed: ${error.message}`);
       }
     );
-    this.responseCache.set(key, { expiresAt: now + ESPNApiService.RESPONSE_CACHE_TTL_MS, data });
+    this.responseCache.set(key, { expiresAt: now + ttlMs, data });
     data.catch(() => this.responseCache.delete(key));
     return data;
   }
@@ -492,13 +492,13 @@ export class ESPNApiService {
   async getLeagueData(
     leagueId: string,
     views: string[],
-    options: { scoringPeriodId?: number; filter?: object; subPath?: string } = {}
+    options: { scoringPeriodId?: number; filter?: object; subPath?: string; ttlMs?: number } = {}
   ): Promise<any> {
     const query = new URLSearchParams();
     for (const view of views) query.append('view', view);
     if (options.scoringPeriodId) query.append('scoringPeriodId', String(options.scoringPeriodId));
     const path = `/seasons/${this.year}/segments/0/leagues/${encodeURIComponent(leagueId)}${options.subPath || ''}`;
-    return this.cachedGet(`${path}?${query}`, options.filter);
+    return this.cachedGet(`${path}?${query}`, options.filter, true, options.ttlMs);
   }
 
   async getProTeamSchedules(): Promise<any[]> {
