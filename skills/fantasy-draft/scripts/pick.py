@@ -1,0 +1,431 @@
+"""Who to draft right now, in under a second. Reads the local board cache
+(draft_cache.py), makes one small request for the live picks, and ranks
+the options.
+
+    python3 <skill>/scripts/pick.py                      # live draft
+    python3 <skill>/scripts/pick.py --league NNN  # another league / mock draft
+    python3 <skill>/scripts/pick.py --taken "Name, Name"  # picks ESPN hasn't shown yet
+    python3 <skill>/scripts/pick.py --simulate-picks 23   # test: rewind a finished draft
+
+How it decides:
+- Simulates every pick before your turn, and between your turn and your next
+  one, team by team in snake order: each team takes the player with the best
+  ADP (ESPN rank as fallback) after adjusting for its roster (a team with its
+  QB or TE filled rarely takes another early; nobody takes D/ST or K before
+  the last rounds; teams already deep at RB/WR slow down) and for position
+  runs (two of the last three picks at a position make it more likely).
+- VONA (value over next available): a player's projection minus the best
+  projection left at his position when your next pick comes around, i.e.
+  what you lose by waiting. Blended with VBD (value over replacement).
+- Weighted by roster need (open starting slot > flex > bench), D/ST and K
+  held until the last rounds, injury tags, bye-week stacking, and a small
+  (+/-3%) nudge for easy or tough fantasy-playoff matchups.
+
+Other views, all from the local cache plus the live picks:
+    --player "Name"    full card: ranks, projection, ADP, last season,
+                       injury details, outlook, playoff games, still available?
+    --position RB      best available at one position
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime
+from difflib import get_close_matches
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from draftlib import FLEX_SLOTS, Espn, cache_path, load_env, slot_counts, bench_count, team_for_pick, use_league_arg  # noqa: E402
+
+INJURY_FACTOR = {"OUT": 0.45, "INJURY_RESERVE": 0.45, "SUSPENSION": 0.45, "DOUBTFUL": 0.7, "QUESTIONABLE": 0.92}
+VONA_WEIGHT, VBD_WEIGHT = 0.55, 0.45
+LATE_POSITIONS = ("D/ST", "K")
+
+
+def norm(name: str) -> str:
+    name = re.sub(r"[^a-z0-9/ ]", "", (name or "").lower())
+    return re.sub(r"\b(jr|sr|ii|iii|iv|v)\b", "", name).strip()
+
+
+def market_order(players: list) -> list:
+    """How other drafters are likely to pick: ADP, then ESPN rank."""
+    return sorted(players, key=lambda p: (p["adp"] or 999, p["rank"] or 999))
+
+
+def team_weight(p: dict, roster: list, slots: dict, rounds_left: int, recent: list) -> float:
+    """How likely a team is to want this position now (1 = normal; lower =
+    they'll pass on him even if his ADP says otherwise)."""
+    pos = p["pos"]
+    have = sum(1 for r in roster if r["pos"] == pos)
+    if pos in LATE_POSITIONS:
+        if have:
+            return 0.05
+        return 1.0 if rounds_left <= 2 else 0.15
+    dedicated = slots.get(pos, 0)
+    flex = sum(n for f, n in slots.items() if f in FLEX_SLOTS and pos in FLEX_SLOTS[f])
+    if pos in ("QB", "TE") and dedicated and have >= dedicated:
+        weight = 0.35 if have == dedicated else 0.1
+    elif have >= dedicated + flex + 2:
+        weight = 0.7
+    else:
+        weight = 1.0
+    if sum(1 for x in recent[-3:] if x == pos) >= 2:  # position run in progress
+        weight *= 1.15
+    return weight
+
+
+def simulate(pool: list, start: int, end: int, order: list, dtype: str, me, rosters: dict,
+             slots: dict, rounds: int, n: int, recent: list):
+    """Picks start..end-1 by the other teams. Returns (ids taken, rosters, recent)."""
+    market = market_order(pool)
+    rosters = {t: list(v) for t, v in rosters.items()}
+    recent = list(recent)
+    gone = set()
+    for k in range(start, end):
+        team = team_for_pick(order, dtype, k)
+        if team == me or team is None:
+            continue
+        roster = rosters.setdefault(team, [])
+        rounds_left = rounds - ((k - 1) // n + 1)
+        best, best_score, looked = None, None, 0
+        for cand in market:
+            if cand["id"] in gone:
+                continue
+            score = (cand["adp"] or cand["rank"] or 400) / team_weight(cand, roster, slots, rounds_left, recent)
+            if best_score is None or score < best_score:
+                best, best_score = cand, score
+            looked += 1
+            if looked >= 40:
+                break
+        if best is None:
+            break
+        gone.add(best["id"])
+        roster.append(best)
+        recent.append(best["pos"])
+    return gone, rosters, recent
+
+
+def open_slots(roster: list, slots: dict) -> dict:
+    remaining = dict(slots)
+    leftovers = []
+    for p in roster:
+        if remaining.get(p["pos"], 0) > 0:
+            remaining[p["pos"]] -= 1
+        else:
+            leftovers.append(p["pos"])
+    for pos in leftovers:
+        for flex, eligible in FLEX_SLOTS.items():
+            if pos in eligible and remaining.get(flex, 0) > 0:
+                remaining[flex] -= 1
+                break
+    return {k: v for k, v in remaining.items() if v > 0}
+
+
+def show_lookup(args, players: dict, picks: list, taken: set, cache: dict) -> None:
+    drafted_by = {p["playerId"]: p for p in picks}
+    team_name = lambda tid: cache["teams"].get(str(tid), {}).get("name", f"Team {tid}")  # noqa: E731
+    if args.player:
+        want = norm(args.player)
+        hits = [p for p in players.values() if want and want in norm(p["name"])]
+        if not hits:
+            names = {norm(p["name"]): p for p in players.values()}
+            hits = [names[k] for k in get_close_matches(want, names.keys(), n=3, cutoff=0.6)]
+        if not hits:
+            print(f"No cached player matches \"{args.player}\".")
+        for p in hits[:3]:
+            pick = drafted_by.get(p["id"])
+            status = (f"DRAFTED R{pick['roundId']}.{pick['roundPickNumber']} by {team_name(pick['teamId'])}"
+                      if pick else ("TAKEN (per --taken)" if p["id"] in taken else "AVAILABLE"))
+            print(f"{p['name']} ({p['pos']}, {p['team']}, bye {p['bye']}) — {status}")
+            print(f"  {p.get('pos_rank')} | ESPN rank {p['rank']} | ADP {p['adp']} (ESPN {p['adp_espn']}"
+                  f"{', market ' + str(p['adp_market']) if p.get('adp_market') else ''}) | proj {p['proj']} | VBD {p['vbd']}")
+            print(f"  last season {p['last_season']} pts, {p['last_season_ppg']} ppg | {p['owned']}% rostered")
+            d = p.get("injury_detail") or {}
+            if p["injury"] != "ACTIVE" or d.get("status") not in (None, "Active"):
+                print(f"  injury: {p['injury']} {d.get('body_part') or ''} {('back ~' + d['return']) if d.get('return') else ''} — {d.get('note', '')}")
+            if p.get("playoff_games"):
+                print(f"  playoffs: {', '.join(p['playoff_games'])} (avg defense rank vs {p['pos']}: {p.get('playoff_matchup_rank')}, 32 = easiest)")
+            if p.get("outlook"):
+                print(f"  outlook: {p['outlook']}")
+    if args.position:
+        pos = args.position.upper().replace("DST", "D/ST")
+        avail = sorted((p for p in players.values() if p["pos"] == pos and p["id"] not in taken and p["proj"] is not None),
+                       key=lambda p: -(p["vbd"] if p["vbd"] is not None else -999))
+        print(f"Best available {pos}:")
+        for p in avail[:args.top + 5]:
+            inj = "" if p["injury"] == "ACTIVE" else f", {p['injury']}"
+            print(f"  {p['name']} ({p['team']}, bye {p['bye']}) proj {p['proj']}, VBD {p['vbd']}, ADP {p['adp']}{inj}")
+
+
+def need_factor(p: dict, opened: dict, my_picks_left: int) -> tuple:
+    if p["pos"] in LATE_POSITIONS:
+        late_slots = sum(opened.get(x, 0) for x in LATE_POSITIONS)
+        if opened.get(p["pos"], 0) and my_picks_left <= late_slots + 1:
+            return 1.0, f"fills {p['pos']}"
+        if opened.get(p["pos"], 0):
+            return 0.2, "too early for " + p["pos"]
+        return 0.05, "no slot"
+    if opened.get(p["pos"], 0):
+        return 1.0, f"fills {p['pos']}"
+    for flex, eligible in FLEX_SLOTS.items():
+        if p["pos"] in eligible and opened.get(flex, 0):
+            return 0.95, f"fills {flex}"
+    # Running out of picks to fill starting slots: bench picks can wait
+    if my_picks_left <= sum(opened.values()):
+        return 0.05, "bench (starters still open)"
+    return (0.35 if p["pos"] == "QB" else 0.55), "bench depth"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--taken", default="", help="comma-separated names already drafted that ESPN hasn't shown yet")
+    ap.add_argument("--simulate-picks", type=int, default=int(os.environ["DRAFT_SIMULATE_PICKS"]) if os.environ.get("DRAFT_SIMULATE_PICKS") else None,
+                    help="test only: pretend only the first N picks happened (or set DRAFT_SIMULATE_PICKS)")
+    ap.add_argument("--top", type=int, default=5)
+    ap.add_argument("--picks-made", type=int, help="picks made so far, read from the draft room (ESPN's API hides live picks)")
+    ap.add_argument("--mine", default="", help="comma-separated names already on your team (from the draft room)")
+    ap.add_argument("--player", help="show the cached card for this player (partial names OK)")
+    ap.add_argument("--position", help="list the best available at one position (QB, RB, WR, TE, D/ST, K)")
+    ap.add_argument("--picks-json", help="output of scripts/draftroom.js from the draft-room tab (live picks ESPN's API hides)")
+    use_league_arg()
+    args = ap.parse_args()
+    t0 = time.time()
+
+    espn = Espn(load_env())
+    path = cache_path(espn)
+    if not path.exists():
+        raise SystemExit(f"No board cache at {path}. Run draft_cache.py first (5-15s).")
+    cache = json.loads(path.read_text())
+    players = {p["id"]: p for p in cache["players"]}
+    try:
+        age_h = (time.time() - datetime.fromisoformat(cache["built_at"]).timestamp()) / 3600
+        if age_h > 12:
+            print(f"(board is {age_h:.0f}h old; rerun draft_cache.py for fresh injuries and rankings)")
+    except (KeyError, ValueError):
+        pass
+
+    unseen = 0  # picks the draft room didn't show us; assume ADP's top players went
+    room_picks = []  # (overall, player name, fantasy team name) from the draft room
+    room = json.loads(args.picks_json) if args.picks_json else None
+    room_file = path.parent / f"room-{espn.league_id}.json"
+    if room is None and room_file.exists():
+        # Saved by room_bridge.py from the draft-room tab; only trust it if fresh
+        saved = json.loads(room_file.read_text())
+        if time.time() - saved.get("received_at", 0) < 120:
+            room = saved
+            print(f"(live picks from the draft room, {time.time() - saved['received_at']:.0f}s old)")
+    if room:
+        teams_n = cache["team_count"]
+        my_name = norm(cache["teams"].get(str(cache.get("my_team_id")), {}).get("name", ""))
+        seen = {}
+        bogus = {"queue", "draft", "add", "remove"}  # player-list buttons, not teams
+        room["feed"] = [f for f in room.get("feed", []) if norm(f[3]) not in bogus]
+        room["history"] = [h for h in room.get("history", []) if norm(h[2]) not in bogus]
+        room["roster"] = [r for r in room.get("roster", []) if norm(r[1]) not in bogus]
+        for rnd, pick_in_round, name, team in room.get("feed", []):
+            seen[(rnd - 1) * teams_n + pick_in_round] = (name, team)
+        for overall, name, team in room.get("history", []):
+            seen[overall] = (name, team)
+        # A fantasy team's name read as a "player" (page layout quirk): drop it
+        team_names = {norm(t["name"]) for t in cache["teams"].values()} | {norm(t) for _, t in seen.values()}
+        seen = {k: v for k, v in seen.items() if norm(v[0]) not in team_names}
+        mine_names = [name for name, team in seen.values() if norm(team) == my_name]
+        other_names = [name for name, team in seen.values() if norm(team) != my_name]
+        made = (room["clock"] - 1) if room.get("clock") else max(seen, default=0)
+        room_picks = sorted((k, name, team) for k, (name, team) in seen.items())
+
+        # Roster panel names like "C. Brown": match first initial + last name,
+        # preferring the higher-ranked player if two fit
+        panel = []
+        for slot, short in room.get("roster", []):
+            if " D/ST" in short or "." not in short:
+                panel.append(short)
+                continue
+            initial, last = short.split(".", 1)
+            allowed = {"FLEX": ("RB", "WR", "TE")}.get(slot, (slot,)) if slot != "BE" else None
+            fits = [p for p in players.values()
+                    if norm(p["name"]).startswith(norm(initial))
+                    and " ".join(norm(p["name"]).split()[1:]) == norm(last)
+                    and (allowed is None or p["pos"] in allowed)]
+            if fits:
+                panel.append(min(fits, key=lambda p: p["rank"] or 9999)["name"])
+        # The panel can show any team; only trust it when it's clearly yours:
+        # its team label matches, or (no label) it has no more players than
+        # you've drafted and none of them were picked by someone else.
+        league = cache.get("league", {})
+        order_ids = league.get("draft_order_ids") or sorted(int(k) for k in cache["teams"])
+        my_made = sum(1 for k in range(1, made + 1)
+                      if team_for_pick(order_ids, league.get("draft_type") or "SNAKE", k) == cache.get("my_team_id"))
+        label = norm(room.get("roster_team") or "")
+        others = {norm(x) for x in other_names}
+        if label:
+            panel_ok = label == my_name or my_name.startswith(label.rstrip("."))
+        else:
+            panel_ok = len(panel) <= my_made and not any(norm(x) in others for x in panel)
+        if panel and not panel_ok:
+            print("(draft room's roster panel is showing another team; using the pick feed for your roster)")
+        else:
+            mine_names += panel
+        args.mine = ",".join(filter(None, [args.mine] + mine_names))
+        args.taken = ",".join(filter(None, [args.taken] + other_names))
+        args.picks_made = max(args.picks_made or 0, made)
+        unseen = max(made - len(seen), 0)
+        if unseen:
+            print(f"(draft room showed {len(seen)} of {made} picks; assuming the {unseen} missing ones went by ADP)")
+
+    try:
+        live = espn.get(espn.league_url, ["mDraftDetail", "mSettings"], timeout=8)
+    except Exception as exc:  # ESPN down, or a finished mock league already deleted
+        if room is None and not (args.player or args.position):
+            raise SystemExit(f"Couldn't reach ESPN ({exc}) and no draft-room picks are available.")
+        league = cache.get("league", {})
+        order_ids = league.get("draft_order_ids") or sorted(int(k) for k in cache["teams"])
+        live = {"draftDetail": {"picks": []}, "settings": {
+            "draftSettings": {"pickOrder": order_ids, "type": league.get("draft_type") or "SNAKE",
+                              "timePerSelection": league.get("seconds_per_pick")},
+            "rosterSettings": {}}}
+        print(f"(ESPN API unavailable: {exc}; using cached league settings)")
+    detail = live.get("draftDetail", {})
+    settings = live.get("settings", {})
+    ds = settings.get("draftSettings", {})
+    order, dtype = ds.get("pickOrder") or [], ds.get("type", "SNAKE")
+    picks = sorted((p for p in detail.get("picks", []) if p.get("playerId") not in (None, 0, -1)),
+                   key=lambda p: p["overallPickNumber"])
+    drafted = bool(detail.get("drafted"))
+    if args.simulate_picks is not None:
+        picks, drafted = picks[: args.simulate_picks], False
+    slots = slot_counts(settings) or cache["starting_slots"]
+    rounds = sum(slots.values()) + (bench_count(settings) or cache["bench"])
+    n = len(order) or cache["team_count"]
+    total = rounds * n
+    if drafted or len(picks) >= total:
+        if args.player or args.position:
+            show_lookup(args, players, picks, {p["playerId"] for p in picks}, cache)
+        print(f"Draft is complete ({len(picks)} picks).")
+        return
+
+    me = cache.get("my_team_id") or espn.team_id
+    taken = {p["playerId"] for p in picks}
+    unknown = []
+    mine_ids = set()
+    by_norm = {norm(p["name"]): p for p in players.values()}
+
+    def find(name: str):
+        hit = by_norm.get(norm(name)) or next((p for k, p in by_norm.items() if norm(name) in k), None)
+        if not hit:
+            close = get_close_matches(norm(name), by_norm.keys(), n=1, cutoff=0.75)
+            hit = by_norm[close[0]] if close else None
+        return hit
+
+    for name in filter(None, (x.strip() for x in (args.taken + "," + args.mine).split(","))):
+        hit = find(name)
+        if hit:
+            taken.add(hit["id"])
+            if norm(name) in [norm(x) for x in args.mine.split(",")]:
+                mine_ids.add(hit["id"])
+        else:
+            unknown.append(name)
+
+    current = max(args.picks_made or 0, len(picks)) + 1
+    mine = [k for k in range(current, total + 1) if team_for_pick(order, dtype, k) == me]
+    if not mine:
+        print("You have no picks left.")
+        return
+    my_pick = mine[0]
+    before_me = my_pick - current
+    wait = (mine[1] - my_pick - 1) if len(mine) > 1 else 0
+
+    roster = [players[p["playerId"]] for p in picks if p["teamId"] == me and p["playerId"] in players]
+    roster += [players[i] for i in mine_ids if all(r["id"] != i for r in roster)]
+    opened = open_slots(roster, slots)
+    avail = [p for p in players.values() if p["id"] not in taken and p["proj"] is not None]
+    if unseen:
+        assumed = {p["id"] for p in market_order(avail)[:unseen]}
+        avail = [p for p in avail if p["id"] not in assumed]
+    if args.player or args.position:
+        show_lookup(args, players, picks, taken, cache)
+        print(f"[{len(picks)} picks live from ESPN; board cached {cache['built_at']}; {time.time() - t0:.2f}s]")
+        return
+    # Every team's roster so far, for the team-aware simulation
+    team_by_name = {norm(t["name"]): int(tid) for tid, t in cache["teams"].items()}
+    rosters, history = {}, []
+    for pk in picks:
+        if pk["playerId"] in players:
+            rosters.setdefault(pk["teamId"], []).append(players[pk["playerId"]])
+            history.append((pk["overallPickNumber"], players[pk["playerId"]]["pos"]))
+    for overall, name, team in room_picks:
+        pl, tid = find(name), team_by_name.get(norm(team))
+        if pl and tid is not None:
+            rosters.setdefault(tid, []).append(pl)
+            history.append((overall, pl["pos"]))
+    recent = [pos for _, pos in sorted(history)][-3:]
+
+    # Expected board when your pick comes up, then what's gone by your next one
+    gone_first, rosters_at_mine, recent_at_mine = simulate(avail, current, my_pick, order, dtype, me, rosters, slots, rounds, n, recent)
+    pool = [p for p in avail if p["id"] not in gone_first]
+    next_mine = mine[1] if len(mine) > 1 else my_pick + 1
+    gone_later, _, _ = simulate(pool, my_pick + 1, next_mine, order, dtype, me, rosters_at_mine, slots, rounds, n, recent_at_mine)
+    my_byes = {(p["pos"], p["bye"]) for p in roster}
+
+    scored = []
+    for c in sorted(pool, key=lambda p: -(p["vbd"] or 0))[:60]:
+        later = [p for p in pool if p["id"] != c["id"] and p["id"] not in gone_later]
+        next_same = max((p["proj"] for p in later if p["pos"] == c["pos"]), default=0)
+        vona = c["proj"] - next_same
+        need, need_why = need_factor(c, opened, len(mine))
+        injury = INJURY_FACTOR.get(c["injury"], 1.0)
+        bye = 0.97 if (c["pos"], c["bye"]) in my_byes else 1.0
+        # Playoff schedule nudge: rank 1 (toughest) -3% ... rank 32 (easiest) +3%
+        playoff = 1 + 0.03 * ((c.get("playoff_matchup_rank") or 16.5) - 16.5) / 15.5
+        base = VONA_WEIGHT * max(vona, 0) + VBD_WEIGHT * max(c["vbd"] or 0, 0)
+        if base <= 0:  # late rounds: everyone's below replacement, go by projection
+            base = 0.1 * c["proj"]
+        # Expert second opinion (FantasyPros): +/-10% when experts rank him
+        # well above or below where drafters take him
+        ecr, market_rank = c.get("ecr"), c["adp"] or c["rank"]
+        expert = 1 + max(-0.1, min(0.1, 0.1 * (market_rank - ecr) / max(ecr, 10))) if ecr and market_rank else 1.0
+        scored.append((base * need * injury * bye * playoff * expert, c, vona, need_why))
+    scored.sort(key=lambda x: -x[0])
+
+    def line(s):
+        _, c, vona, why = s
+        tags = [f"VONA {vona:+.0f}", f"VBD {c['vbd']:+.0f}" if c["vbd"] is not None else "", why]
+        if c["injury"] != "ACTIVE":
+            d = c.get("injury_detail") or {}
+            tags.append(" ".join(x for x in (c["injury"], d.get("body_part"), f"back ~{d['return']}" if d.get("return") else "") if x))
+        pm = c.get("playoff_matchup_rank")
+        if pm and (pm <= 8 or pm >= 25):
+            tags.append(f"{'easy' if pm >= 25 else 'tough'} playoff schedule ({', '.join(c.get('playoff_games', []))})")
+        if (c["pos"], c["bye"]) in my_byes:
+            tags.append(f"same bye ({c['bye']}) as your {c['pos']}")
+        if c["adp"]:
+            tags.append(f"ADP {c['adp']:.0f}")
+        if c.get("ecr"):
+            tags.append(f"experts #{c['ecr']}" + (f" (tier {c['ecr_tier']})" if c.get("ecr_tier") else ""))
+        if c["id"] in gone_later and len(mine) > 1:
+            tags.append(f"likely gone by pick {mine[1]}")
+        return f"{c['name']} ({c['pos']}, {c['team']}, bye {c['bye']}) — " + ", ".join(t for t in tags if t)
+
+    rnd, pir = (my_pick - 1) // n + 1, (my_pick - 1) % n + 1
+    if before_me == 0:
+        print(f"YOU'RE ON THE CLOCK: pick {my_pick} (R{rnd}.{pir}), {ds.get('timePerSelection', '?')}s. After this: pick {mine[1] if len(mine) > 1 else '-'} ({wait} picks later).")
+    else:
+        up = cache["teams"].get(str(team_for_pick(order, dtype, current)), {}).get("name", "?")
+        print(f"On the clock: {up}, pick {current}. You're up in {before_me} picks (pick {my_pick}, R{rnd}.{pir}); board below simulates the picks before then (ADP + each team's needs).")
+    print("TAKE: " + line(scored[0]))
+    if len(scored) > 1:
+        print("Next best: " + line(scored[1]))
+    for s in scored[2:args.top]:
+        print("  also: " + line(s))
+    print("Your roster: " + (", ".join(f"{p['name']} ({p['pos']})" for p in roster) or "none yet")
+          + " | open: " + (", ".join(f"{k} {v}" for k, v in opened.items()) or "starters full"))
+    if unknown:
+        print("Couldn't match --taken names: " + ", ".join(unknown))
+    print(f"[{len(picks)} picks live from ESPN; board cached {cache['built_at']}; {time.time() - t0:.2f}s]")
+
+
+if __name__ == "__main__":
+    main()

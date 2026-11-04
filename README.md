@@ -58,6 +58,21 @@ tailscale funnel --bg --set-path /injury-news http://127.0.0.1:8767
 # ...and so on for each path in the table above
 ```
 
+## Skills
+
+[`skills/fantasy-draft/`](skills/fantasy-draft/) is the Claude skill that drafts with these servers on a
+60-second (or 30-second) clock. `draft_cache.py` caches the whole player pool
+locally at prep (ESPN projections, ADP, FantasyPros expert rankings, injury
+details, byes, playoff schedule, VBD); `pick.py` ranks each pick in well under a
+second (value over next available from a team-aware simulation of the other
+teams' picks, roster needs, injuries, byes). ESPN's API hides live picks until a
+draft ends and allows one draft-room connection per person, so the "Draft
+Bridge" bookmarklet (`make_bookmarklet.py`) runs `draftroom.js` in your own
+draft tab and posts picks to `room_bridge.py` on 127.0.0.1, which also shows the
+recommended pick on the draft page. `draft_report.py` grades the draft afterward.
+Credentials come from a local `.env` (`ESPN_S2`, `ESPN_SWID`, `ESPN_LEAGUE_ID`,
+`ESPN_TEAM_ID`); nothing secret is in the skill.
+
 ## Credits
 
 `comanager/` is derived from
