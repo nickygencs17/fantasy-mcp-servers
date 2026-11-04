@@ -73,6 +73,95 @@ recommended pick on the draft page. `draft_report.py` grades the draft afterward
 Credentials come from a local `.env` (`ESPN_S2`, `ESPN_SWID`, `ESPN_LEAGUE_ID`,
 `ESPN_TEAM_ID`); nothing secret is in the skill.
 
+### Setting up the live draft assistant
+
+You need a Mac (or any computer) with Python 3.9+ and Chrome, plus Claude
+Code or the Claude desktop app's Code tab. The scripts use only the Python
+standard library, so there is nothing to `pip install`.
+
+**1. Install the skill.** Copy [`skills/fantasy-draft/`](skills/fantasy-draft/)
+into your project's `.claude/skills/` folder (or `~/.claude/skills/` for all
+projects). To use it on claude.ai too, zip the folder and upload it under
+Settings → Capabilities → Skills.
+
+```bash
+mkdir -p ~/fantasy/.claude/skills && cp -R skills/fantasy-draft ~/fantasy/.claude/skills/
+```
+
+**2. Add your league's `.env`** in the folder you'll run Claude from (here
+`~/fantasy`). Get `ESPN_S2` and `SWID` from your browser's espn.com cookies
+(DevTools → Application → Cookies → `espn_s2` and `SWID`); the league id is
+`leagueId=` in your league's URL, and the team id is `teamId=` on your team
+page. Never commit this file.
+
+```bash
+cat > ~/fantasy/.env <<'EOF'
+ESPN_S2=your_espn_s2_cookie
+ESPN_SWID={YOUR-SWID-WITH-BRACES}
+ESPN_LEAGUE_ID=123456789
+ESPN_TEAM_ID=4
+ESPN_YEAR=2026
+EOF
+```
+
+`ESPN_ENV_FILE` points the scripts at a `.env` somewhere else. For a mock
+draft, add `--league <mock league id>` to any script; your team in that league
+is found from your SWID.
+
+**3. Prep before the draft** (takes about 20 seconds; re-run on draft day for
+fresh injuries). This writes `draft-cache/board-<league>-<year>.json`:
+
+```bash
+cd ~/fantasy && python3 .claude/skills/fantasy-draft/scripts/draft_cache.py
+```
+
+**4. Install the Draft Bridge bookmark (once).**
+
+```bash
+cd ~/fantasy && python3 .claude/skills/fantasy-draft/scripts/make_bookmarklet.py
+```
+
+Open `scripts/bookmarklet.html` in Chrome and drag the **Draft Bridge** link to
+your bookmarks bar. Check the bookmark's URL starts with `javascript:`. If it
+starts with `file://`, you saved the install page instead: run
+`pbcopy < .claude/skills/fantasy-draft/scripts/bookmarklet.txt` and paste that
+as the bookmark's URL. After the scripts change, run `make_bookmarklet.py`
+again and replace the bookmark; a newer bookmark replaces an older reader
+already running in the tab.
+
+**5. On draft day:**
+
+1. Start the bridge and leave it running. It listens on 127.0.0.1:8781 only
+   (`DRAFT_BRIDGE_PORT` changes the port):
+   ```bash
+   cd ~/fantasy && python3 .claude/skills/fantasy-draft/scripts/room_bridge.py
+   ```
+2. Join the draft in your own Chrome tab and click **Draft Bridge** once. A
+   note at the bottom right confirms it's sending. Click it again if you reload
+   the tab. Don't open the draft room anywhere else (another browser, or Claude
+   in Chrome): ESPN allows one connection per person and will drop yours.
+3. When you're on the clock, a green **TAKE** box shows the pick on the draft
+   page, usually within a second. You can also say "my turn" to Claude, which
+   runs:
+   ```bash
+   python3 .claude/skills/fantasy-draft/scripts/pick.py --top 3
+   ```
+   `--player "<name>"` looks up one player, and `--position RB` lists the best
+   available at a position.
+4. After the draft, grade it (grade, value vs ADP, how your lineup ranks) and stop the bridge (Ctrl+C):
+   ```bash
+   python3 .claude/skills/fantasy-draft/scripts/draft_report.py
+   ```
+
+**Troubleshooting**
+
+- *No green box:* check the bridge is running, then click the bookmark again.
+  If the bookmark opens a new tab, fix its URL as in step 4. Chrome may ask
+  once to allow the page to reach devices on your local network; allow it.
+- *"board is Nh old":* the cache is over 12 hours old; re-run `draft_cache.py` before the draft starts.
+- *Wrong picks or team:* make sure the draft tab's league matches the
+  `--league` (or `ESPN_LEAGUE_ID`) you prepped.
+
 ## Credits
 
 `comanager/` is derived from
