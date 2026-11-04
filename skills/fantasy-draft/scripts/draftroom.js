@@ -87,7 +87,11 @@
     .then(reply => { state.posts++; state.lastError = null; show(reply); })
     .catch(e => { state.errors++; state.lastError = String(e); });
 
+  // Take over from an older copy of the reader already running in this tab
+  const VERSION = 3;
+  if (state.timer && state.version !== VERSION) { clearInterval(state.timer); state.timer = null; }
   if (!state.timer) {
+    state.version = VERSION;
     state.timer = setInterval(post, 2000);
     post();
   }

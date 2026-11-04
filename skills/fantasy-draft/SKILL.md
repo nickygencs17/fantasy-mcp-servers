@@ -95,7 +95,7 @@ draft room itself:
    has ignored the panel and used the pick feed instead; suggest the user
    switch the panel back to their own team.
 
-If the user reloads their draft tab, they click the bookmarklet again. After the scripts change, rerun `make_bookmarklet.py` and have the user replace the old bookmark with the new link (the bookmark holds its own copy of the reader).
+If the user reloads their draft tab, they click the bookmarklet again. If clicking the bookmark opens a new tab instead, it was saved as the install page: copy `scripts/bookmarklet.txt` to the clipboard (`pbcopy < bookmarklet.txt`) and have them paste it as the bookmark's URL (it must start with `javascript:`). A newer bookmark clicked in a tab running an older reader replaces it. After the scripts change, rerun `make_bookmarklet.py` and have the user replace the old bookmark with the new link (the bookmark holds its own copy of the reader).
 
 ## Each pick ("my turn", "who should I take", pasted picks)
 
