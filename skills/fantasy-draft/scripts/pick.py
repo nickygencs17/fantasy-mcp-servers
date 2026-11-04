@@ -276,8 +276,24 @@ def main():
         if unseen:
             print(f"(draft room showed {len(seen)} of {made} picks; assuming the {unseen} missing ones went by ADP)")
 
+    # During a live draft ESPN's API hides the picks, so with fresh draft-room
+    # picks the only thing ESPN adds is the draft order (set when the draft
+    # starts). Save that response once per draft and skip ESPN after that.
+    settings_file = path.parent / f"live-{espn.league_id}.json"
+    live = None
+    if room and settings_file.exists():
+        saved_live = json.loads(settings_file.read_text())
+        draft_start = (cache.get("league", {}).get("draft_date") or 0) / 1000
+        fetched = saved_live.get("_fetched_at", 0)
+        # Trust it if it was fetched after the draft started (order is final) and recently
+        if fetched > draft_start + 30 and time.time() - fetched < 6 * 3600:
+            live = saved_live
     try:
-        live = espn.get(espn.league_url, ["mDraftDetail", "mSettings"], timeout=8)
+        if live is None:
+            live = espn.get(espn.league_url, ["mDraftDetail", "mSettings"], timeout=8)
+            live["_fetched_at"] = time.time()
+            if room:
+                settings_file.write_text(json.dumps(live))
     except Exception as exc:  # ESPN down, or a finished mock league already deleted
         if room is None and not (args.player or args.position):
             raise SystemExit(f"Couldn't reach ESPN ({exc}) and no draft-room picks are available.")
