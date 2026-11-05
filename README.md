@@ -131,8 +131,15 @@ already running in the tab.
 
 **5. On draft day:**
 
-1. Start the bridge and leave it running. It listens on 127.0.0.1:8781 only
-   (`DRAFT_BRIDGE_PORT` changes the port):
+1. Make sure the bridge is running. It listens on 127.0.0.1:8781 only
+   (`DRAFT_BRIDGE_PORT` changes the port). Easiest: install it once to start
+   at login (a launchd agent on macOS; if macOS asks whether Python may access
+   the folder, allow it):
+   ```bash
+   cd ~/fantasy && python3 .claude/skills/fantasy-draft/scripts/install_bridge.py
+   ```
+   `install_bridge.py status` checks it and `install_bridge.py uninstall`
+   removes it. Or just run it for one draft and leave the terminal open:
    ```bash
    cd ~/fantasy && python3 .claude/skills/fantasy-draft/scripts/room_bridge.py
    ```
@@ -140,24 +147,42 @@ already running in the tab.
    note at the bottom right confirms it's sending. Click it again if you reload
    the tab. Don't open the draft room anywhere else (another browser, or Claude
    in Chrome): ESPN allows one connection per person and will drop yours.
-3. When you're on the clock, a green **TAKE** box shows the pick on the draft
-   page, usually within a second. You can also say "my turn" to Claude, which
-   runs:
+3. When you're on the clock, the tab chimes and its title flashes, a green
+   **TAKE** box shows the pick on the draft page (usually within a second), and
+   your Mac shows a notification with the pick, so you hear it even with the
+   tab in the background. You can also say "my turn" to Claude, which runs:
    ```bash
    python3 .claude/skills/fantasy-draft/scripts/pick.py --top 3
    ```
    `--player "<name>"` looks up one player, and `--position RB` lists the best
    available at a position.
-4. After the draft, grade it (grade, value vs ADP, how your lineup ranks) and stop the bridge (Ctrl+C):
+4. After the draft, grade it. You get two grades: one from ESPN projections
+   and an expert grade from FantasyPros rankings, a second opinion that
+   doesn't use the projections the picks were made with. Each pick is also
+   shown against ADP, ESPN rank and expert rank. If you started the bridge by
+   hand, stop it (Ctrl+C).
    ```bash
    python3 .claude/skills/fantasy-draft/scripts/draft_report.py
    ```
+
+**How the picks are chosen.** Before each of your picks, `pick.py` simulates
+the other teams' picks 40 times. Each team takes the player the room values
+most, adjusted for its roster and position runs. "Values most" is a blend of
+ADP, ESPN's current rank and the FantasyPros rank, re-fit to the draft's own
+picks after 8 picks: mock drafters follow ESPN's rank, a real preseason room
+follows ADP more. That gives each player's chance of lasting to your next
+pick. The top options are then scored by value over the next player available
+at the position and over replacement, roster need, injuries and byes, and
+paired with the best player likely left at your next pick. So someone who'll
+still be there waits, and a scarce player goes now.
 
 **Troubleshooting**
 
 - *No green box:* check the bridge is running, then click the bookmark again.
   If the bookmark opens a new tab, fix its URL as in step 4. Chrome may ask
   once to allow the page to reach devices on your local network; allow it.
+- *No chime:* the sound is set up when you click the bookmark, so click it
+  again after reloading the tab; check the tab isn't muted.
 - *"board is Nh old":* the cache is over 12 hours old; re-run `draft_cache.py` before the draft starts.
 - *Wrong picks or team:* make sure the draft tab's league matches the
   `--league` (or `ESPN_LEAGUE_ID`) you prepped.

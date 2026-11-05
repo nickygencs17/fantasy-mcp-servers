@@ -5,9 +5,11 @@ saves it to draft-cache/room-<league>.json for pick.py to read.
 
 When the page says it's the user's turn, the bridge also runs pick.py once
 for that pick and returns the recommendation, which draftroom.js shows on the
-draft page itself.
+draft page itself, and (on a Mac) posts a notification with the pick, so you
+hear about it even when the draft tab is in the background.
 
     python3 <skill>/scripts/room_bridge.py      # from the folder with .env; leave running
+    python3 <skill>/scripts/install_bridge.py   # or: start it automatically at login
 
 Listens on 127.0.0.1 only (your Mac), port 8781 or $DRAFT_BRIDGE_PORT.
 """
@@ -27,6 +29,18 @@ PICK_SCRIPT = Path(__file__).resolve().parent / "pick.py"
 _recommendations = {}  # (league, clock) -> {"take": ..., "next": ...}
 
 
+def notify(title: str, text: str) -> None:
+    """macOS notification with a sound; does nothing elsewhere."""
+    if sys.platform != "darwin":
+        return
+    esc = lambda s: s.replace("\\", "\\\\").replace('"', '\\"')  # noqa: E731
+    try:
+        subprocess.Popen(["osascript", "-e", f'display notification "{esc(text)}" with title "{esc(title)}" sound name "Glass"'],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
 def recommend(league: str, clock: int) -> dict:
     """Run pick.py once per (league, pick) and keep its TAKE / Next best lines."""
     key = (league, clock)
@@ -41,6 +55,7 @@ def recommend(league: str, clock: int) -> dict:
         nxt = next((l[len("Next best: "):] for l in lines if l.startswith("Next best: ")), None)
         if take:
             _recommendations[key] = {"take": take, "next": nxt}
+            notify(f"Your pick (#{clock})", "TAKE " + take.split(" — ")[0] + (f"  ·  next: {nxt.split(' — ')[0]}" if nxt else ""))
         else:
             return {"take": None, "next": None, "error": (lines[-1] if lines else "pick.py gave no answer")}
     return _recommendations[key]

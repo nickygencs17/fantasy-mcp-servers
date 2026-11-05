@@ -18,8 +18,9 @@
   const state = (window.__draftRoom ||= { byRound: {}, byOverall: {}, posts: 0, errors: 0 });
   const POS = '(?:QB|RB|WR|TE|K|D/ST)';
   // Before the draft the player list's buttons ("QUEUE", "DRAFT") look like
-  // pick rows; never treat them as a team or a player.
-  const NOT_TEAM = /^(QUEUE|DRAFT|ADD|REMOVE)$/;
+  // pick rows, and Pick History rows sometimes pick up the clock (":02") or a
+  // "DRAFTED" label; never treat those as a team or a player.
+  const NOT_TEAM = /^(QUEUE|DRAFT|DRAFTED|ADD|REMOVE|:?\d+)$/;
   const feed = new RegExp(`\\n([^\\n]+?) / [A-Z]{2,3} ${POS}\\nR(\\d+), P(\\d+) - ([^\\n]+)`, 'g');
   const table = new RegExp(`\\n(\\d{1,3})\\n([^\\n]+)\\n(?:[A-Z]{1,4}\\n)?[A-Z]{2,3}\\n${POS}\\n([^\\n]+)\\n[\\d.]+\\n`, 'g');
 
@@ -82,13 +83,49 @@
     }
   };
 
-  const post = () => fetch(BRIDGE, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(read()) })
-    .then(r => r.ok ? r.json() : null)
-    .then(reply => { state.posts++; state.lastError = null; show(reply); })
-    .catch(e => { state.errors++; state.lastError = String(e); });
+  // On-the-clock alert: a short chime and a flashing tab title when your turn
+  // starts (the audio is set up on the bookmark click, which browsers require)
+  try { state.audio ||= new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { /* no audio */ }
+  const chime = () => {
+    const ctx = state.audio;
+    if (!ctx) return;
+    ctx.resume?.();
+    [880, 1175].forEach((hz, i) => {
+      const osc = ctx.createOscillator(), gain = ctx.createGain();
+      osc.frequency.value = hz;
+      gain.gain.setValueAtTime(0.0001, ctx.currentTime + i * 0.18);
+      gain.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + i * 0.18 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + i * 0.18 + 0.3);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(ctx.currentTime + i * 0.18);
+      osc.stop(ctx.currentTime + i * 0.18 + 0.32);
+    });
+  };
+  const alertTurn = (myTurn) => {
+    if (myTurn && !state.wasMyTurn) {
+      chime();
+      state.title = document.title;
+      let on = false;
+      clearInterval(state.flash);
+      state.flash = setInterval(() => { on = !on; document.title = on ? '⏰ YOUR PICK' : state.title; }, 700);
+    } else if (!myTurn && state.wasMyTurn) {
+      clearInterval(state.flash);
+      if (state.title) document.title = state.title;
+    }
+    state.wasMyTurn = myTurn;
+  };
+
+  const post = () => {
+    const data = read();
+    alertTurn(data.my_turn);
+    return fetch(BRIDGE, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) })
+      .then(r => r.ok ? r.json() : null)
+      .then(reply => { state.posts++; state.lastError = null; show(reply); })
+      .catch(e => { state.errors++; state.lastError = String(e); });
+  };
 
   // Take over from an older copy of the reader already running in this tab
-  const VERSION = 3;
+  const VERSION = 4;
   if (state.timer && state.version !== VERSION) { clearInterval(state.timer); state.timer = null; }
   if (!state.timer) {
     state.version = VERSION;

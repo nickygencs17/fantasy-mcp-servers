@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from draftlib import FLEX_SLOTS, Espn, cache_path, load_env, use_league_arg  # noqa: E402
-from pick import norm  # noqa: E402
+from pick import norm, room_seen  # noqa: E402
 
 
 def best_lineup(roster: list, slots: dict) -> tuple:
@@ -31,6 +31,25 @@ def best_lineup(roster: list, slots: dict) -> tuple:
                 lineup.append((slot, pick))
                 left.remove(pick)
     return lineup, sum(p.get("proj") or 0 for _, p in lineup)
+
+
+def expert_lineup(roster: list, slots: dict) -> tuple:
+    """Starting lineup by FantasyPros expert rank (a second opinion that
+    doesn't use the ESPN projections the picks were made with). Returns
+    (lineup, average expert rank of the starters; lower is better)."""
+    left = sorted(roster, key=lambda p: p.get("ecr") or 400)
+    lineup, ranks = [], []
+    for slot, count in sorted(slots.items(), key=lambda kv: kv[0] in FLEX_SLOTS):
+        if slot in ("K", "D/ST"):  # experts' overall list ranks these in the hundreds; skip them
+            continue
+        eligible = FLEX_SLOTS.get(slot, (slot,))
+        for _ in range(count):
+            pick = next((p for p in left if p["pos"] in eligible), None)
+            if pick:
+                lineup.append((slot, pick))
+                left.remove(pick)
+            ranks.append(pick.get("ecr") or 400 if pick else 400)  # an empty starting slot counts as rank 400
+    return lineup, (sum(ranks) / len(ranks) if ranks else 400)
 
 
 def grade(rank: int, teams: int) -> str:
@@ -67,11 +86,7 @@ def main():
         if not room_file.exists():
             raise SystemExit("No picks available: the draft isn't complete on ESPN and no draft-room data was saved.")
         room = json.loads(room_file.read_text())
-        seen = {}
-        for rnd, pir, name, team in room.get("feed", []):
-            seen[(rnd - 1) * n + pir] = (name, team)
-        for overall, name, team in room.get("history", []):
-            seen[overall] = (name, team)
+        seen = room_seen(room, cache)
         for overall, (name, team) in sorted(seen.items()):
             pl = by_norm.get(norm(name)) or next((p for k, p in by_norm.items() if norm(name) in k), None)
             tid = team_by_name.get(norm(team))
@@ -87,6 +102,9 @@ def main():
     slots = cache["starting_slots"]
     totals = {tid: best_lineup([p for _, p in r], slots)[1] for tid, r in rosters.items()}
     ranking = sorted(totals, key=lambda t: -totals[t])
+    has_experts = sum(1 for p in players.values() if p.get("ecr")) > 100
+    expert_avg = {tid: expert_lineup([p for _, p in r], slots)[1] for tid, r in rosters.items()}
+    expert_ranking = sorted(expert_avg, key=lambda t: expert_avg[t])
 
     out = [f"# Draft report: {teams.get(me, 'your team')}", f"_Picks from {source}; projections: "
            f"{cache.get('league', {}).get('projection_basis', 'ESPN')}._", ""]
@@ -97,23 +115,33 @@ def main():
     rank = ranking.index(me) + 1 if me in ranking else None
     values = [(o - pl["adp"], o, pl) for o, pl in mine if pl.get("adp")]
     avg_value = sum(v for v, _, _ in values) / len(values) if values else 0
-    out.append(f"**Grade: {grade(rank, len(ranking)) if rank else '?'}**, projected starters "
-               f"{total:.0f} pts, #{rank} of {len(ranking)}; average pick {avg_value:+.1f} spots vs ADP "
-               f"({'value' if avg_value > 0 else 'reaching'})")
+    out.append(f"**Grade: {grade(rank, len(ranking)) if rank else '?'}** by ESPN projections: starters "
+               f"{total:.0f} pts, #{rank} of {len(ranking)}")
+    if has_experts and me in expert_avg:
+        erank = expert_ranking.index(me) + 1
+        out.append(f"**Expert grade: {grade(erank, len(expert_ranking))}** by FantasyPros rankings (a second opinion "
+                   f"that doesn't use the projections the picks were made with): QB/RB/WR/TE starters average expert rank "
+                   f"{expert_avg[me]:.0f}, #{erank} of {len(expert_ranking)}")
+    stale_adp = sum(1 for p in players.values() if p.get("adp_market")) < 20  # no live market ADP (mid-season)
+    out.append(f"Average pick {avg_value:+.1f} spots vs ADP ({'value' if avg_value > 0 else 'reaching'}"
+               + ("; with no live market ADP, drafters follow ESPN's current rank more than ADP)" if stale_adp else ")"))
     if values:
         steal = max(values, key=lambda v: v[0])
         reach = min(values, key=lambda v: v[0])
         out.append(f"- Best value: {steal[2]['name']} at pick {steal[1]} (ADP {steal[2]['adp']:.0f}, {steal[0]:+.0f})")
         out.append(f"- Biggest reach: {reach[2]['name']} at pick {reach[1]} (ADP {reach[2]['adp']:.0f}, {reach[0]:+.0f})")
-    out += ["", "## Your picks", "", "| Pick | Player | Pos | ADP | vs ADP | Proj | VBD |", "|---|---|---|---|---|---|---|"]
+    out += ["", "## Your picks", "", "| Pick | Player | Pos | ADP | vs ADP | ESPN rank | Experts | Proj | VBD |",
+            "|---|---|---|---|---|---|---|---|---|"]
     for o, pl in mine:
         diff = f"{o - pl['adp']:+.0f}" if pl.get("adp") else "-"
-        out.append(f"| {o} | {pl['name']} | {pl['pos']} | {pl.get('adp') or '-'} | {diff} | {pl.get('proj') or '-'} | {pl.get('vbd') if pl.get('vbd') is not None else '-'} |")
+        out.append(f"| {o} | {pl['name']} | {pl['pos']} | {pl.get('adp') or '-'} | {diff} | {pl.get('rank') or '-'} | "
+                   f"{pl.get('ecr') or '-'} | {pl.get('proj') or '-'} | {pl.get('vbd') if pl.get('vbd') is not None else '-'} |")
     out += ["", "## Projected starting lineup", ""]
     out += [f"- {slot}: {pl['name']} ({pl['pos']}, {pl['team']}) {pl.get('proj') or 0:.0f}" for slot, pl in lineup]
-    out += ["", "## League (projected starters)", ""]
+    out += ["", "## League", "", "| # | Team | Projected starters | Expert rank (avg starter) |", "|---|---|---|---|"]
     for i, tid in enumerate(ranking, 1):
-        out.append(f"{i}. {teams.get(tid, tid)}: {totals[tid]:.0f}{'  (you)' if tid == me else ''}")
+        er = f"#{expert_ranking.index(tid) + 1} ({expert_avg[tid]:.0f})" if has_experts and tid in expert_avg else "-"
+        out.append(f"| {i} | {teams.get(tid, tid)}{' (you)' if tid == me else ''} | {totals[tid]:.0f} | {er} |")
     text = "\n".join(out)
     print(text)
     report = path.parent / f"report-{espn.league_id}.md"

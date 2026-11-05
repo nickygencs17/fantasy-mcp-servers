@@ -9,11 +9,17 @@ the options.
 
 How it decides:
 - Simulates every pick before your turn, and between your turn and your next
-  one, team by team in snake order: each team takes the player with the best
-  ADP (ESPN rank as fallback) after adjusting for its roster (a team with its
-  QB or TE filled rarely takes another early; nobody takes D/ST or K before
-  the last rounds; teams already deep at RB/WR slow down) and for position
-  runs (two of the last three picks at a position make it more likely).
+  one, team by team in snake order: each team takes the player the room
+  values most (a blend of ADP, ESPN's current rank and the expert rank,
+  re-fit to this draft's own picks after 8 picks) after adjusting for its
+  roster (a team with its QB or TE filled rarely takes another early; nobody
+  takes D/ST or K before the last rounds; teams already deep at RB/WR slow
+  down) and for position runs (two of the last three picks at a position
+  make it more likely). 40 randomized runs give each player's chance of
+  lasting to your next pick.
+- One-pick lookahead: each top option is paired with the best player likely
+  left at your next pick, so someone who'll still be there waits and a
+  scarce player goes now.
 - VONA (value over next available): a player's projection minus the best
   projection left at his position when your next pick comes around, i.e.
   what you lose by waiting. Blended with VBD (value over replacement).
@@ -29,7 +35,9 @@ Other views, all from the local cache plus the live picks:
 
 import argparse
 import json
+import math
 import os
+import random
 import re
 import sys
 import time
@@ -43,6 +51,21 @@ from draftlib import FLEX_SLOTS, Espn, cache_path, load_env, slot_counts, bench_
 INJURY_FACTOR = {"OUT": 0.45, "INJURY_RESERVE": 0.45, "SUSPENSION": 0.45, "DOUBTFUL": 0.7, "QUESTIONABLE": 0.92}
 VONA_WEIGHT, VBD_WEIGHT = 0.55, 0.45
 LATE_POSITIONS = ("D/ST", "K")
+# Look one pick ahead: for the top options, add the value of the best player
+# likely left at your next pick (from SIM_RUNS randomized runs of the picks in
+# between), so a player who'll still be there waits and the one who won't is
+# taken now. LOOKAHEAD scales that second pick (0 turns it off).
+LOOKAHEAD = float(os.environ.get("DRAFT_LOOKAHEAD", "1.0"))
+LOOKAHEAD_TOP = 8
+SIM_RUNS = 40
+# How the other drafters pick: a blend of ESPN ADP, ESPN's current rank and
+# the FantasyPros expert rank. Re-fit from the draft's own picks once
+# CALIBRATE_AFTER picks are in (mock drafters follow ESPN's rank; a real
+# preseason room follows ADP more).
+SOURCES = ("adp", "rank", "ecr")
+DEFAULT_WEIGHTS = {"adp": 0.4, "rank": 0.4, "ecr": 0.2}
+DEFAULT_SIGMA = 0.3
+CALIBRATE_AFTER = 8
 
 
 def norm(name: str) -> str:
@@ -50,9 +73,53 @@ def norm(name: str) -> str:
     return re.sub(r"\b(jr|sr|ii|iii|iv|v)\b", "", name).strip()
 
 
-def market_order(players: list) -> list:
-    """How other drafters are likely to pick: ADP, then ESPN rank."""
-    return sorted(players, key=lambda p: (p["adp"] or 999, p["rank"] or 999))
+def expected_pick(p: dict, weights: dict = None) -> float:
+    """Where the room is expected to take this player (overall pick)."""
+    weights = weights or DEFAULT_WEIGHTS
+    total = wsum = 0.0
+    for key, w in weights.items():
+        v = p.get(key)
+        if w and v:
+            total += w * v
+            wsum += w
+    return total / wsum if wsum else 400.0
+
+
+def calibrate(picked: list) -> tuple:
+    """Fit the blend to picks already made: picked = [(overall, player)].
+    Returns (weights, sigma, note). Sigma is the spread of log(actual /
+    expected), used to randomize the simulation."""
+    rows = [(o, p) for o, p in picked if p and o > 0]
+    if len(rows) < CALIBRATE_AFTER:
+        return DEFAULT_WEIGHTS, DEFAULT_SIGMA, ""
+    present = [s for s in SOURCES if sum(1 for _, p in rows if p.get(s)) >= 0.6 * len(rows)]
+    grid = []
+    steps = [i / 4 for i in range(5)]
+    for a in steps:
+        for b in steps:
+            c = round(1 - a - b, 2)
+            if c < 0:
+                continue
+            w = {k: v for k, v in zip(SOURCES, (a, b, c)) if k in present and v}
+            if w and abs(sum(w.values()) - 1) < 1e-6:
+                grid.append(w)
+    if not grid:
+        return DEFAULT_WEIGHTS, DEFAULT_SIGMA, ""
+
+    def resid(w):
+        return [math.log(o / expected_pick(p, w)) for o, p in rows]
+    best = min(grid, key=lambda w: sum(abs(r) for r in resid(w)))
+    res = resid(best)
+    mean = sum(res) / len(res)
+    sigma = max(0.15, min(0.6, (sum((r - mean) ** 2 for r in res) / len(res)) ** 0.5))
+    note = "room drafts by " + " + ".join(f"{int(v * 100)}% {k.replace('ecr', 'experts').replace('rank', 'ESPN rank').replace('adp', 'ADP')}"
+                                          for k, v in sorted(best.items(), key=lambda kv: -kv[1]))
+    return best, sigma, note
+
+
+def market_order(players: list, weights: dict = None) -> list:
+    """How other drafters are likely to pick."""
+    return sorted(players, key=lambda p: expected_pick(p, weights))
 
 
 def team_weight(p: dict, roster: list, slots: dict, rounds_left: int, recent: list) -> float:
@@ -78,9 +145,15 @@ def team_weight(p: dict, roster: list, slots: dict, rounds_left: int, recent: li
 
 
 def simulate(pool: list, start: int, end: int, order: list, dtype: str, me, rosters: dict,
-             slots: dict, rounds: int, n: int, recent: list):
-    """Picks start..end-1 by the other teams. Returns (ids taken, rosters, recent)."""
-    market = market_order(pool)
+             slots: dict, rounds: int, n: int, recent: list, weights: dict = None,
+             sigma: float = 0.0, rng=None):
+    """Picks start..end-1 by the other teams. Returns (ids taken, rosters, recent).
+    With sigma and rng, each player's expected pick is randomized once per run
+    (drafters disagree), for the chance-he-lasts estimate."""
+    value = {p["id"]: expected_pick(p, weights) for p in pool}
+    if sigma and rng:
+        value = {k: v * math.exp(rng.gauss(0, sigma)) for k, v in value.items()}
+    market = sorted(pool, key=lambda p: value[p["id"]])
     rosters = {t: list(v) for t, v in rosters.items()}
     recent = list(recent)
     gone = set()
@@ -94,7 +167,7 @@ def simulate(pool: list, start: int, end: int, order: list, dtype: str, me, rost
         for cand in market:
             if cand["id"] in gone:
                 continue
-            score = (cand["adp"] or cand["rank"] or 400) / team_weight(cand, roster, slots, rounds_left, recent)
+            score = value[cand["id"]] / team_weight(cand, roster, slots, rounds_left, recent)
             if best_score is None or score < best_score:
                 best, best_score = cand, score
             looked += 1
@@ -106,6 +179,21 @@ def simulate(pool: list, start: int, end: int, order: list, dtype: str, me, rost
         roster.append(best)
         recent.append(best["pos"])
     return gone, rosters, recent
+
+
+def gone_chance(pool: list, start: int, end: int, order: list, dtype: str, me, rosters: dict,
+                slots: dict, rounds: int, n: int, recent: list, weights: dict, sigma: float,
+                seed: int, runs: int = SIM_RUNS) -> tuple:
+    """Randomized runs of picks start..end-1. Returns (chance each player is
+    taken, the set taken in each run)."""
+    rng = random.Random(seed)
+    count, sets = {}, []
+    for _ in range(runs):
+        gone, _, _ = simulate(pool, start, end, order, dtype, me, rosters, slots, rounds, n, recent, weights, sigma, rng)
+        sets.append(gone)
+        for pid in gone:
+            count[pid] = count.get(pid, 0) + 1
+    return {pid: c / runs for pid, c in count.items()}, sets
 
 
 def open_slots(roster: list, slots: dict) -> dict:
@@ -179,6 +267,86 @@ def need_factor(p: dict, opened: dict, my_picks_left: int) -> tuple:
     return (0.35 if p["pos"] == "QB" else 0.55), "bench depth"
 
 
+def room_seen(room: dict, cache: dict) -> dict:
+    """Picks the draft room showed: {overall: (player name, fantasy team)}.
+    Pick History rows sometimes pick up the clock (":02") or a "DRAFTED"
+    label as the team, so a row only counts when its team is a real team in
+    this league, and the scrolling feed (more reliable) wins over the table."""
+    n = cache["team_count"]
+    known = {norm(t["name"]) for t in cache["teams"].values()}
+    bogus = {"queue", "draft", "drafted", "add", "remove"}
+
+    def ok(team, name):
+        t = norm(team)
+        return t not in bogus and (t in known or not known) and norm(name) not in known
+
+    seen = {}
+    for overall, name, team in room.get("history", []):
+        if ok(team, name) and 0 < overall <= n * 40:
+            seen[overall] = (name, team)
+    for rnd, pick_in_round, name, team in room.get("feed", []):
+        if ok(team, name):
+            seen[(rnd - 1) * n + pick_in_round] = (name, team)
+    return seen
+
+
+def rank_options(avail: list, roster: list, opened: dict, mine: list, current: int, order: list, dtype: str,
+                 me, rosters: dict, slots: dict, rounds: int, n: int, recent: list,
+                 weights: dict = None, sigma: float = DEFAULT_SIGMA, lookahead: float = None) -> tuple:
+    """Score the options for the user's next pick (mine[0]).
+    Returns (scored, chance each player is gone by the pick after that)."""
+    lookahead = LOOKAHEAD if lookahead is None else lookahead
+    my_pick = mine[0]
+    # Expected board when your pick comes up, then what's gone by your next one
+    gone_first, rosters_at_mine, recent_at_mine = simulate(avail, current, my_pick, order, dtype, me, rosters,
+                                                           slots, rounds, n, recent, weights)
+    pool = [p for p in avail if p["id"] not in gone_first]
+    next_mine = mine[1] if len(mine) > 1 else my_pick + 1
+    gone_later, _, _ = simulate(pool, my_pick + 1, next_mine, order, dtype, me, rosters_at_mine, slots, rounds, n,
+                                recent_at_mine, weights)
+    chance, runs = gone_chance(pool, my_pick + 1, next_mine, order, dtype, me, rosters_at_mine, slots, rounds, n,
+                               recent_at_mine, weights, sigma, seed=my_pick) if len(mine) > 1 else ({}, [])
+    my_byes = {(p["pos"], p["bye"]) for p in roster}
+    picks_left = len(mine)
+
+    scored = []
+    for c in sorted(pool, key=lambda p: -(p["vbd"] or 0))[:60]:
+        later = [p for p in pool if p["id"] != c["id"] and p["id"] not in gone_later]
+        next_same = max((p["proj"] for p in later if p["pos"] == c["pos"]), default=0)
+        vona = c["proj"] - next_same
+        need, need_why = need_factor(c, opened, picks_left)
+        injury = INJURY_FACTOR.get(c["injury"], 1.0)
+        bye = 0.97 if (c["pos"], c["bye"]) in my_byes else 1.0
+        # Playoff schedule nudge: rank 1 (toughest) -3% ... rank 32 (easiest) +3%
+        playoff = 1 + 0.03 * ((c.get("playoff_matchup_rank") or 16.5) - 16.5) / 15.5
+        base = VONA_WEIGHT * max(vona, 0) + VBD_WEIGHT * max(c["vbd"] or 0, 0)
+        if base <= 0:  # late rounds: everyone's below replacement, go by projection
+            base = 0.1 * c["proj"]
+        # Expert second opinion (FantasyPros): +/-10% when experts rank him
+        # well above or below where drafters take him
+        ecr, market_rank = c.get("ecr"), c["adp"] or c["rank"]
+        expert = 1 + max(-0.1, min(0.1, 0.1 * (market_rank - ecr) / max(ecr, 10))) if ecr and market_rank else 1.0
+        scored.append((base * need * injury * bye * playoff * expert, c, vona, need_why, base * injury * playoff * expert))
+    scored.sort(key=lambda x: -x[0])
+
+    if lookahead and runs:
+        # Pair this pick with the best player expected at the next one: take
+        # c now, then in each randomized run, the best player still there
+        # (scored for the roster with c on it). Averaged over the runs.
+        def next_value(c):
+            opened_after = open_slots(roster + [c], slots)
+            later = sorted(((rest * need_factor(d, opened_after, picks_left - 1)[0], d["id"])
+                            for _, d, _, _, rest in scored if d["id"] != c["id"]), reverse=True)
+            total = 0.0
+            for gone in runs:
+                total += next((v for v, pid in later if pid not in gone), 0.0)
+            return total / len(runs)
+        top = [(s[0] + lookahead * next_value(s[1]),) + s[1:] for s in scored[:LOOKAHEAD_TOP]]
+        top.sort(key=lambda x: -x[0])
+        scored = top + scored[LOOKAHEAD_TOP:]
+    return [s[:4] for s in scored], chance
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--taken", default="", help="comma-separated names already drafted that ESPN hasn't shown yet")
@@ -220,18 +388,8 @@ def main():
     if room:
         teams_n = cache["team_count"]
         my_name = norm(cache["teams"].get(str(cache.get("my_team_id")), {}).get("name", ""))
-        seen = {}
-        bogus = {"queue", "draft", "add", "remove"}  # player-list buttons, not teams
-        room["feed"] = [f for f in room.get("feed", []) if norm(f[3]) not in bogus]
-        room["history"] = [h for h in room.get("history", []) if norm(h[2]) not in bogus]
-        room["roster"] = [r for r in room.get("roster", []) if norm(r[1]) not in bogus]
-        for rnd, pick_in_round, name, team in room.get("feed", []):
-            seen[(rnd - 1) * teams_n + pick_in_round] = (name, team)
-        for overall, name, team in room.get("history", []):
-            seen[overall] = (name, team)
-        # A fantasy team's name read as a "player" (page layout quirk): drop it
-        team_names = {norm(t["name"]) for t in cache["teams"].values()} | {norm(t) for _, t in seen.values()}
-        seen = {k: v for k, v in seen.items() if norm(v[0]) not in team_names}
+        room["roster"] = [r for r in room.get("roster", []) if norm(r[1]) not in {"queue", "draft", "add", "remove"}]
+        seen = room_seen(room, cache)
         mine_names = [name for name, team in seen.values() if norm(team) == my_name]
         other_names = [name for name, team in seen.values() if norm(team) != my_name]
         made = (room["clock"] - 1) if room.get("clock") else max(seen, default=0)
@@ -358,53 +516,32 @@ def main():
     roster += [players[i] for i in mine_ids if all(r["id"] != i for r in roster)]
     opened = open_slots(roster, slots)
     avail = [p for p in players.values() if p["id"] not in taken and p["proj"] is not None]
+
+    # Every team's roster so far, for the team-aware simulation, and every
+    # pick seen so far, to learn how this room drafts
+    team_by_name = {norm(t["name"]): int(tid) for tid, t in cache["teams"].items()}
+    rosters, picked = {}, []
+    for pk in picks:
+        if pk["playerId"] in players:
+            rosters.setdefault(pk["teamId"], []).append(players[pk["playerId"]])
+            picked.append((pk["overallPickNumber"], players[pk["playerId"]]))
+    for overall, name, team in room_picks:
+        pl, tid = find(name), team_by_name.get(norm(team))
+        if pl and tid is not None:
+            rosters.setdefault(tid, []).append(pl)
+            picked.append((overall, pl))
+    weights, sigma, room_note = calibrate(picked)
     if unseen:
-        assumed = {p["id"] for p in market_order(avail)[:unseen]}
+        assumed = {p["id"] for p in market_order(avail, weights)[:unseen]}
         avail = [p for p in avail if p["id"] not in assumed]
     if args.player or args.position:
         show_lookup(args, players, picks, taken, cache)
         print(f"[{len(picks)} picks live from ESPN; board cached {cache['built_at']}; {time.time() - t0:.2f}s]")
         return
-    # Every team's roster so far, for the team-aware simulation
-    team_by_name = {norm(t["name"]): int(tid) for tid, t in cache["teams"].items()}
-    rosters, history = {}, []
-    for pk in picks:
-        if pk["playerId"] in players:
-            rosters.setdefault(pk["teamId"], []).append(players[pk["playerId"]])
-            history.append((pk["overallPickNumber"], players[pk["playerId"]]["pos"]))
-    for overall, name, team in room_picks:
-        pl, tid = find(name), team_by_name.get(norm(team))
-        if pl and tid is not None:
-            rosters.setdefault(tid, []).append(pl)
-            history.append((overall, pl["pos"]))
-    recent = [pos for _, pos in sorted(history)][-3:]
-
-    # Expected board when your pick comes up, then what's gone by your next one
-    gone_first, rosters_at_mine, recent_at_mine = simulate(avail, current, my_pick, order, dtype, me, rosters, slots, rounds, n, recent)
-    pool = [p for p in avail if p["id"] not in gone_first]
-    next_mine = mine[1] if len(mine) > 1 else my_pick + 1
-    gone_later, _, _ = simulate(pool, my_pick + 1, next_mine, order, dtype, me, rosters_at_mine, slots, rounds, n, recent_at_mine)
+    recent = [p["pos"] for _, p in sorted(picked, key=lambda x: x[0])][-3:]
+    scored, mine_next_gone = rank_options(avail, roster, opened, mine, current, order, dtype, me, rosters,
+                                          slots, rounds, n, recent, weights, sigma)
     my_byes = {(p["pos"], p["bye"]) for p in roster}
-
-    scored = []
-    for c in sorted(pool, key=lambda p: -(p["vbd"] or 0))[:60]:
-        later = [p for p in pool if p["id"] != c["id"] and p["id"] not in gone_later]
-        next_same = max((p["proj"] for p in later if p["pos"] == c["pos"]), default=0)
-        vona = c["proj"] - next_same
-        need, need_why = need_factor(c, opened, len(mine))
-        injury = INJURY_FACTOR.get(c["injury"], 1.0)
-        bye = 0.97 if (c["pos"], c["bye"]) in my_byes else 1.0
-        # Playoff schedule nudge: rank 1 (toughest) -3% ... rank 32 (easiest) +3%
-        playoff = 1 + 0.03 * ((c.get("playoff_matchup_rank") or 16.5) - 16.5) / 15.5
-        base = VONA_WEIGHT * max(vona, 0) + VBD_WEIGHT * max(c["vbd"] or 0, 0)
-        if base <= 0:  # late rounds: everyone's below replacement, go by projection
-            base = 0.1 * c["proj"]
-        # Expert second opinion (FantasyPros): +/-10% when experts rank him
-        # well above or below where drafters take him
-        ecr, market_rank = c.get("ecr"), c["adp"] or c["rank"]
-        expert = 1 + max(-0.1, min(0.1, 0.1 * (market_rank - ecr) / max(ecr, 10))) if ecr and market_rank else 1.0
-        scored.append((base * need * injury * bye * playoff * expert, c, vona, need_why))
-    scored.sort(key=lambda x: -x[0])
 
     def line(s):
         _, c, vona, why = s
@@ -421,8 +558,12 @@ def main():
             tags.append(f"ADP {c['adp']:.0f}")
         if c.get("ecr"):
             tags.append(f"experts #{c['ecr']}" + (f" (tier {c['ecr_tier']})" if c.get("ecr_tier") else ""))
-        if c["id"] in gone_later and len(mine) > 1:
-            tags.append(f"likely gone by pick {mine[1]}")
+        if len(mine) > 1:
+            chance = mine_next_gone.get(c["id"], 0)
+            if chance >= 0.6:
+                tags.append(f"likely gone by pick {mine[1]} ({chance:.0%})")
+            elif chance <= 0.25:
+                tags.append(f"should last to pick {mine[1]} ({1 - chance:.0%})")
         return f"{c['name']} ({c['pos']}, {c['team']}, bye {c['bye']}) — " + ", ".join(t for t in tags if t)
 
     rnd, pir = (my_pick - 1) // n + 1, (my_pick - 1) % n + 1
@@ -440,6 +581,8 @@ def main():
           + " | open: " + (", ".join(f"{k} {v}" for k, v in opened.items()) or "starters full"))
     if unknown:
         print("Couldn't match --taken names: " + ", ".join(unknown))
+    if room_note:
+        print(f"({room_note}, learned from {len(picked)} picks)")
     print(f"[{len(picks)} picks live from ESPN; board cached {cache['built_at']}; {time.time() - t0:.2f}s]")
 
 

@@ -64,8 +64,11 @@ ESPN's API hides every pick until the draft is over (each pick slot shows
 an empty player while the draft runs), so live picks have to come from the
 draft room itself:
 
-1. Start the local bridge in the background (it listens on 127.0.0.1 only
-   and saves picks to `draft-cache/room-<league>.json`):
+1. Make sure the local bridge is running (it listens on 127.0.0.1 only and
+   saves picks to `draft-cache/room-<league>.json`). Check with
+   `python3 <this skill's folder>/scripts/install_bridge.py status`. If the
+   user installed auto-start (`install_bridge.py`, run once from the folder
+   with `.env`), it's already running; otherwise start it in the background:
 
    ```bash
    python3 <this skill's folder>/scripts/room_bridge.py
@@ -89,8 +92,10 @@ draft room itself:
 4. **On-page picks:** when the draft room says it's the user's turn, the
    bridge runs `pick.py` itself and the bookmarklet shows a green
    **TAKE: …** box (with the reason and next best) at the top right of the
-   draft page within about 2 seconds. The user can pick straight from it;
-   "my turn" in chat still works the same way.
+   draft page within about 2 seconds, with a chime and a flashing tab title,
+   and the Mac shows a notification with the pick (so they hear it with the
+   tab in the background). The user can pick straight from it; "my turn" in
+   chat still works the same way.
 5. If `pick.py` prints that the roster panel is showing another team, it
    has ignored the panel and used the pick feed instead; suggest the user
    switch the panel back to their own team.
@@ -125,14 +130,19 @@ If the user reloads their draft tab, they click the bookmarklet again. If clicki
 2. Answer with the script's `TAKE:` line, in the output format below. Trust
    its ranking: it already weighs what the user loses by waiting (VONA:
    projected points over the best player left at that position when the
-   user's next pick comes around, assuming others draft by ADP), value over
+   user's next pick comes around), a one-pick lookahead (it pairs each top
+   option with the best player likely left at the user's next pick, so a
+   player who'll still be there waits and a scarce one goes now), value over
    replacement, open starting slots (holding D/ST until the last rounds and
    forcing open starters when picks run short), injury tags (with body part
    and expected return), bye stacking, a small nudge for easy or tough
    fantasy-playoff schedules, and FantasyPros' expert rank. "Who's gone
-   before your next pick" comes from a pick-by-pick simulation of the other
-   teams (ADP adjusted for each team's roster needs and position runs);
-   `likely gone by pick N` on an alternate means don't count on him later. Only override it if the user told you something it can't
+   before your next pick" comes from 40 randomized pick-by-pick simulations
+   of the other teams (each team's roster needs and position runs), using a
+   blend of ADP, ESPN's current rank and expert rank that it re-fits to this
+   room's own picks after 8 picks (it prints e.g. "room drafts by 75% ESPN
+   rank + 25% ADP"); `likely gone by pick N (80%)` means don't count on him
+   later, `should last to pick N (90%)` means he can wait. Only override it if the user told you something it can't
    know (e.g. "I don't want any Jets").
 
 3. **If the user says that player is gone:** run `pick.py --taken "<name>"`
@@ -156,10 +166,15 @@ Offer the report card (it takes a second):
 python3 <this skill's folder>/scripts/draft_report.py   # add --league NNN for a mock
 ```
 
-It grades the user's draft (projected starting lineup vs every other team),
-lists each pick against ADP (best value, biggest reach), and saves
-`draft-cache/report-<league>.md`. Share the headline (grade, rank, best
-value, biggest reach) in a few lines. Then stop `room_bridge.py`.
+It gives two grades: one from ESPN projections (projected starting lineup vs
+every other team) and an expert grade from FantasyPros rankings (average
+expert rank of each team's QB/RB/WR/TE starters), a second opinion that
+doesn't use the projections the picks were made with. It also lists each
+pick against ADP, ESPN rank and expert rank (best value, biggest reach), and
+saves `draft-cache/report-<league>.md`. Share the headline (both grades,
+rank, best value, biggest reach) in a few lines; if the grades disagree, say
+so. Then stop `room_bridge.py` if you started it (leave it if auto-start is
+installed).
 
 ## Output format
 
