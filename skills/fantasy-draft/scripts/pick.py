@@ -20,6 +20,9 @@ How it decides:
 - One-pick lookahead: each top option is paired with the best player likely
   left at your next pick, so someone who'll still be there waits and a
   scarce player goes now.
+- Handcuffs: after the starting rounds, the backup RB behind each of your
+  starting RBs gets a bonus (a quarter of the starter's value over
+  replacement), taken when he might not last or the free bench picks run out.
 - VONA (value over next available): a player's projection minus the best
   projection left at his position when your next pick comes around, i.e.
   what you lose by waiting. Blended with VBD (value over replacement).
@@ -57,6 +60,11 @@ LATE_POSITIONS = ("D/ST", "K")
 # taken now. LOOKAHEAD scales that second pick (0 turns it off).
 LOOKAHEAD = float(os.environ.get("DRAFT_LOOKAHEAD", "1.0"))
 LOOKAHEAD_TOP = 8
+# Handcuffs: once the starting rounds are done, the backup RB on the same NFL
+# team as one of your starting RBs gets a bonus worth this share of that
+# starter's value over replacement (x1.5 if the starter is already hurt), so
+# you can plug him in if the starter goes down.
+HANDCUFF_SHARE = float(os.environ.get("DRAFT_HANDCUFF_SHARE", "0.25"))
 SIM_RUNS = 40
 # How the other drafters pick: a blend of ESPN ADP, ESPN's current rank and
 # the FantasyPros expert rank. Re-fit from the draft's own picks once
@@ -290,9 +298,33 @@ def room_seen(room: dict, cache: dict) -> dict:
     return seen
 
 
+def handcuffs(roster: list, players, slots: dict) -> dict:
+    """{backup RB id: (your starter, bonus)} for each of your starting RBs:
+    the highest-projected healthy RB on the same NFL team besides him."""
+    flex_rb = sum(c for f, c in slots.items() if f in FLEX_SLOTS and "RB" in FLEX_SLOTS[f])
+    starters = sorted((p for p in roster if p["pos"] == "RB"), key=lambda p: -(p["proj"] or 0))
+    starters = starters[: slots.get("RB", 0) + flex_rb]
+    mine = {p["id"] for p in roster}
+    out = {}
+    for st in starters:
+        if not st.get("team") or (st["vbd"] or 0) <= 0:
+            continue
+        backups = [p for p in players if p["pos"] == "RB" and p["team"] == st["team"] and p["id"] != st["id"]
+                   and p["injury"] not in ("OUT", "INJURY_RESERVE", "SUSPENSION") and (p["proj"] or 0) > 0]
+        if not backups:
+            continue
+        backup = max(backups, key=lambda p: p["proj"])
+        if backup["id"] in mine:
+            continue
+        hurt = 1.5 if st["injury"] != "ACTIVE" else 1.0
+        out[backup["id"]] = (st, HANDCUFF_SHARE * st["vbd"] * hurt)
+    return out
+
+
 def rank_options(avail: list, roster: list, opened: dict, mine: list, current: int, order: list, dtype: str,
                  me, rosters: dict, slots: dict, rounds: int, n: int, recent: list,
-                 weights: dict = None, sigma: float = DEFAULT_SIGMA, lookahead: float = None) -> tuple:
+                 weights: dict = None, sigma: float = DEFAULT_SIGMA, lookahead: float = None,
+                 all_players: list = None) -> tuple:
     """Score the options for the user's next pick (mine[0]).
     Returns (scored, chance each player is gone by the pick after that)."""
     lookahead = LOOKAHEAD if lookahead is None else lookahead
@@ -308,15 +340,25 @@ def rank_options(avail: list, roster: list, opened: dict, mine: list, current: i
                                recent_at_mine, weights, sigma, seed=my_pick) if len(mine) > 1 else ({}, [])
     my_byes = {(p["pos"], p["bye"]) for p in roster}
     picks_left = len(mine)
+    # Handcuffs only after the starting rounds (bench rounds)
+    late = (my_pick - 1) // n + 1 > sum(slots.values())
+    cuffs = handcuffs(roster, all_players or avail, slots) if late and HANDCUFF_SHARE else {}
+    cuffs = {k: v for k, v in cuffs.items() if any(p["id"] == k for p in pool)}
+    # Picks not needed for open starting slots; once they're down to the
+    # number of handcuffs still on the board, it's now or never
+    free_picks = picks_left - sum(opened.values())
+    now_or_never = free_picks <= len(cuffs)
 
     scored = []
-    for c in sorted(pool, key=lambda p: -(p["vbd"] or 0))[:60]:
+    top = sorted(pool, key=lambda p: -(p["vbd"] or 0))[:60]
+    top += [p for p in pool if p["id"] in cuffs and p not in top]
+    for c in top:
         later = [p for p in pool if p["id"] != c["id"] and p["id"] not in gone_later]
         next_same = max((p["proj"] for p in later if p["pos"] == c["pos"]), default=0)
         vona = c["proj"] - next_same
         need, need_why = need_factor(c, opened, picks_left)
         injury = INJURY_FACTOR.get(c["injury"], 1.0)
-        bye = 0.97 if (c["pos"], c["bye"]) in my_byes else 1.0
+        bye = 0.97 if (c["pos"], c["bye"]) in my_byes and c["id"] not in cuffs else 1.0
         # Playoff schedule nudge: rank 1 (toughest) -3% ... rank 32 (easiest) +3%
         playoff = 1 + 0.03 * ((c.get("playoff_matchup_rank") or 16.5) - 16.5) / 15.5
         base = VONA_WEIGHT * max(vona, 0) + VBD_WEIGHT * max(c["vbd"] or 0, 0)
@@ -326,7 +368,16 @@ def rank_options(avail: list, roster: list, opened: dict, mine: list, current: i
         # well above or below where drafters take him
         ecr, market_rank = c.get("ecr"), c["adp"] or c["rank"]
         expert = 1 + max(-0.1, min(0.1, 0.1 * (market_rank - ecr) / max(ecr, 10))) if ecr and market_rank else 1.0
-        scored.append((base * need * injury * bye * playoff * expert, c, vona, need_why, base * injury * playoff * expert))
+        score = base * need * injury * bye * playoff * expert
+        if c["id"] in cuffs and need_why == "bench depth":
+            starter, bonus = cuffs[c["id"]]
+            # Wait rule for handcuffs: only worth a pick now if he might not
+            # last to the next one, or the free bench picks are running out
+            urgency = 1.0 if now_or_never or not chance else chance.get(c["id"], 0)
+            score += bonus * injury * urgency
+            last = [w for w in starter["name"].split() if w.rstrip(".") not in ("Jr", "Sr", "II", "III", "IV", "V")][-1]
+            need_why = f"handcuff to {last} ({starter['team']})"
+        scored.append((score, c, vona, need_why, base * injury * playoff * expert))
     scored.sort(key=lambda x: -x[0])
 
     if lookahead and runs:
@@ -540,7 +591,7 @@ def main():
         return
     recent = [p["pos"] for _, p in sorted(picked, key=lambda x: x[0])][-3:]
     scored, mine_next_gone = rank_options(avail, roster, opened, mine, current, order, dtype, me, rosters,
-                                          slots, rounds, n, recent, weights, sigma)
+                                          slots, rounds, n, recent, weights, sigma, all_players=list(players.values()))
     my_byes = {(p["pos"], p["bye"]) for p in roster}
 
     def line(s):
@@ -552,7 +603,7 @@ def main():
         pm = c.get("playoff_matchup_rank")
         if pm and (pm <= 8 or pm >= 25):
             tags.append(f"{'easy' if pm >= 25 else 'tough'} playoff schedule ({', '.join(c.get('playoff_games', []))})")
-        if (c["pos"], c["bye"]) in my_byes:
+        if (c["pos"], c["bye"]) in my_byes and not why.startswith("handcuff"):
             tags.append(f"same bye ({c['bye']}) as your {c['pos']}")
         if c["adp"]:
             tags.append(f"ADP {c['adp']:.0f}")
@@ -571,7 +622,7 @@ def main():
         print(f"YOU'RE ON THE CLOCK: pick {my_pick} (R{rnd}.{pir}), {ds.get('timePerSelection', '?')}s. After this: pick {mine[1] if len(mine) > 1 else '-'} ({wait} picks later).")
     else:
         up = cache["teams"].get(str(team_for_pick(order, dtype, current)), {}).get("name", "?")
-        print(f"On the clock: {up}, pick {current}. You're up in {before_me} picks (pick {my_pick}, R{rnd}.{pir}); board below simulates the picks before then (ADP + each team's needs).")
+        print(f"On the clock: {up}, pick {current}. You're up in {before_me} picks (pick {my_pick}, R{rnd}.{pir}); board below simulates the picks before then (how this room drafts + each team's needs).")
     print("TAKE: " + line(scored[0]))
     if len(scored) > 1:
         print("Next best: " + line(scored[1]))

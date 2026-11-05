@@ -142,7 +142,13 @@ If the user reloads their draft tab, they click the bookmarklet again. If clicki
    blend of ADP, ESPN's current rank and expert rank that it re-fits to this
    room's own picks after 8 picks (it prints e.g. "room drafts by 75% ESPN
    rank + 25% ADP"); `likely gone by pick N (80%)` means don't count on him
-   later, `should last to pick N (90%)` means he can wait. Only override it if the user told you something it can't
+   later, `should last to pick N (90%)` means he can wait. Late in the draft it also grabs **handcuffs**: once the
+   starting rounds are done, the backup RB on the same NFL team as one of
+   the user's starting RBs (the highest-projected healthy RB behind him)
+   gets a bonus worth a quarter of that starter's value over replacement
+   (more if the starter is already hurt), tagged `handcuff to Walker (KC)`.
+   It waits on a handcuff who'll last, takes him when the free bench picks
+   run out, and never takes one over an open starting slot (D/ST, K). Only override it if the user told you something it can't
    know (e.g. "I don't want any Jets").
 
 3. **If the user says that player is gone:** run `pick.py --taken "<name>"`

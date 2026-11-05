@@ -174,7 +174,11 @@ follows ADP more. That gives each player's chance of lasting to your next
 pick. The top options are then scored by value over the next player available
 at the position and over replacement, roster need, injuries and byes, and
 paired with the best player likely left at your next pick. So someone who'll
-still be there waits, and a scarce player goes now.
+still be there waits, and a scarce player goes now. In the late rounds it
+also grabs handcuffs: the backup RB behind each of your starting RBs (the
+next-highest projected healthy RB on that NFL team), so if a starter gets hurt
+you can plug the backup straight in. It waits on handcuffs who'll last and
+never takes one over a D/ST or kicker you still need.
 
 **Troubleshooting**
 
